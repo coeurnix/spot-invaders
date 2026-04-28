@@ -20,8 +20,11 @@ const ROOM_CONFIG = {
 	renderDelayMs: 300,
 	inputLeadMs: 300,
 	maxExtrapolateMs: 250,
-	trailMs: 900,
-	sendHz: 4,
+	sendHz: 10,
+	minSendHz: 1,
+	maxSendHz: 10,
+	fullRatePlayerCount: 10,
+	minRatePlayerCount: 100,
 	renderHz: 24,
 };
 

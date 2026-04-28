@@ -25,9 +25,26 @@ body {
 	inset: 0;
 	width: 100vw;
 	height: 100vh;
-	background: #090a0f;
+	background: transparent;
 	touch-action: none;
 	cursor: crosshair;
+}
+
+#media {
+	position: fixed;
+	left: 50%;
+	top: 50%;
+	z-index: 0;
+	width: 100vw;
+	height: 100vh;
+	transform: translate(-50%, -50%);
+	background: #000000;
+	object-fit: contain;
+	pointer-events: none;
+}
+
+#stage {
+	z-index: 1;
 }
 
 #counter {

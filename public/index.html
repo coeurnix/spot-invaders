@@ -7,6 +7,7 @@
 		<link rel="stylesheet" href="/styles.css" />
 	</head>
 	<body>
+		<video id="media" src="https://coeurnix.party/test-video.mp4" muted playsinline loop preload="auto"></video>
 		<canvas id="stage" aria-label="Synchronized multiplayer room"></canvas>
 		<div id="counter">0</div>
 		<aside id="debug" aria-label="Debug panel">
@@ -16,6 +17,7 @@
 			<div><span>socket</span><strong id="debug-status">idle</strong></div>
 			<div><span>offset</span><strong id="debug-offset">0 ms</strong></div>
 			<div><span>rtt</span><strong id="debug-rtt">-</strong></div>
+			<div><span>send hz</span><strong id="debug-sendhz">-</strong></div>
 			<div><span>media</span><strong id="debug-media">0.00 s</strong></div>
 		</aside>
 		<script src="/client.js" defer></script>

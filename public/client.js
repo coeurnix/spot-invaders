@@ -1,8 +1,9 @@
 (() => {
 	const params = new URLSearchParams(location.search);
 	const roomId = params.get("room") || "default";
+	const video = document.getElementById("media");
 	const canvas = document.getElementById("stage");
-	const ctx = canvas.getContext("2d", { alpha: false });
+	const ctx = canvas.getContext("2d", { alpha: true });
 	const counterEl = document.getElementById("counter");
 	const debugRoomEl = document.getElementById("debug-room");
 	const debugPlayersEl = document.getElementById("debug-players");
@@ -10,16 +11,22 @@
 	const debugStatusEl = document.getElementById("debug-status");
 	const debugOffsetEl = document.getElementById("debug-offset");
 	const debugRttEl = document.getElementById("debug-rtt");
+	const debugSendHzEl = document.getElementById("debug-sendhz");
 	const debugMediaEl = document.getElementById("debug-media");
 
 	const defaultConfig = {
 		renderDelayMs: 300,
 		inputLeadMs: 300,
 		maxExtrapolateMs: 250,
-		trailMs: 900,
-		sendHz: 4,
+		sendHz: 10,
+		minSendHz: 1,
+		maxSendHz: 10,
+		fullRatePlayerCount: 10,
+		minRatePlayerCount: 100,
 		renderHz: 24,
 	};
+
+	const videoAspect = 1280 / 720;
 
 	let ws = null;
 	let socketStatus = "idle";
@@ -43,14 +50,20 @@
 	let lastPointerSample = null;
 	let lastCounterText = "";
 	let lastDebugUpdateAt = 0;
+	let lastVideoSyncAt = 0;
 	let nextCanvasDrawAt = 0;
 	let canvasNeedsResize = true;
 	let canvasDirty = true;
-	let canvasNeedsFinalClean = true;
 	let canvasDirtyUntilMediaMs = 0;
 	let dpr = 1;
 	let viewWidth = 0;
 	let viewHeight = 0;
+	let videoRect = {
+		x: 0,
+		y: 0,
+		width: 1,
+		height: 1,
+	};
 
 	const players = new Map();
 	const sampleBuffers = new Map();
@@ -67,6 +80,20 @@
 		return Math.min(1, Math.max(0, value));
 	}
 
+	function pointToVideoSpace(clientX, clientY) {
+		return {
+			x: clamp01((clientX - videoRect.x) / videoRect.width),
+			y: clamp01((clientY - videoRect.y) / videoRect.height),
+		};
+	}
+
+	function normalizedToCanvas(position) {
+		return {
+			x: videoRect.x + position.x * videoRect.width,
+			y: videoRect.y + position.y * videoRect.height,
+		};
+	}
+
 	function wsUrl() {
 		const protocol = location.protocol === "https:" ? "wss:" : "ws:";
 		return `${protocol}//${location.host}/api/room/${encodeURIComponent(roomId)}/ws`;
@@ -77,10 +104,48 @@
 		debugStatusEl.textContent = nextStatus;
 	}
 
-	function markCanvasDirty(untilMediaMs = displayedMediaMs() + config.trailMs) {
+	function markCanvasDirty(untilMediaMs = displayedMediaMs()) {
 		canvasDirty = true;
-		canvasNeedsFinalClean = true;
 		canvasDirtyUntilMediaMs = Math.max(canvasDirtyUntilMediaMs, untilMediaMs);
+	}
+
+	function currentSendHz() {
+		const playerCount = Math.max(1, players.size);
+		const minHz = Math.max(0.25, config.minSendHz || 1);
+		const maxHz = Math.max(minHz, config.maxSendHz || config.sendHz || 10);
+		const fullRateCount = Math.max(1, config.fullRatePlayerCount || 10);
+		const minRateCount = Math.max(fullRateCount + 1, config.minRatePlayerCount || 100);
+		if (playerCount <= fullRateCount) {
+			return maxHz;
+		}
+		if (playerCount >= minRateCount) {
+			return minHz;
+		}
+
+		const t = (playerCount - fullRateCount) / (minRateCount - fullRateCount);
+		return maxHz + (minHz - maxHz) * t;
+	}
+
+	function currentMaxExtrapolateMs() {
+		return Math.max(config.maxExtrapolateMs || 250, 1000 / currentSendHz() + 120);
+	}
+
+	function syncVideo(mediaMs) {
+		const now = performance.now();
+		if (now - lastVideoSyncAt < 250 || !video.duration || !Number.isFinite(video.duration)) {
+			return;
+		}
+		lastVideoSyncAt = now;
+
+		const targetSeconds = (mediaMs / 1000) % video.duration;
+		if (!video.seeking && Math.abs(video.currentTime - targetSeconds) > 0.35) {
+			video.currentTime = targetSeconds;
+		}
+		if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+			video.play().catch(() => {
+				// Muted autoplay is normally allowed; if blocked, the next user gesture retries.
+			});
+		}
 	}
 
 	function connect() {
@@ -282,7 +347,7 @@
 			vy: player.vy,
 			seq: player.lastSeq,
 		});
-		markCanvasDirty(player.lastMediaMs + config.trailMs + config.maxExtrapolateMs);
+		markCanvasDirty(player.lastMediaMs + currentMaxExtrapolateMs());
 	}
 
 	function pushSample(id, sample) {
@@ -365,7 +430,7 @@
 
 		if (a) {
 			const dtMs = mediaMs - a.mediaMs;
-			if (dtMs <= config.maxExtrapolateMs) {
+			if (dtMs <= currentMaxExtrapolateMs()) {
 				return {
 					x: clamp01(a.x + a.vx * (dtMs / 1000)),
 					y: clamp01(a.y + a.vy * (dtMs / 1000)),
@@ -383,10 +448,10 @@
 	}
 
 	function updatePointer(event, resetVelocity) {
-		const rect = canvas.getBoundingClientRect();
 		const now = performance.now();
-		const x = clamp01((event.clientX - rect.left) / rect.width);
-		const y = clamp01((event.clientY - rect.top) / rect.height);
+		const point = pointToVideoSpace(event.clientX, event.clientY);
+		const x = point.x;
+		const y = point.y;
 
 		let vx = 0;
 		let vy = 0;
@@ -421,7 +486,7 @@
 		}
 
 		const now = performance.now();
-		const minInterval = 1000 / Math.max(1, config.sendHz || 60);
+		const minInterval = 1000 / currentSendHz();
 		const canBypassRateLimit = force && seq === 0;
 		if (!canBypassRateLimit && now - lastSentAt < minInterval) {
 			return;
@@ -449,6 +514,16 @@
 		const nextDpr = 1;
 		const nextWidth = Math.max(1, rect.width);
 		const nextHeight = Math.max(1, rect.height);
+		const viewAspect = nextWidth / nextHeight;
+		let videoWidth = nextWidth;
+		let videoHeight = nextHeight;
+		if (viewAspect > videoAspect) {
+			videoHeight = nextHeight;
+			videoWidth = videoHeight * videoAspect;
+		} else {
+			videoWidth = nextWidth;
+			videoHeight = videoWidth / videoAspect;
+		}
 
 		if (canvas.width !== Math.round(nextWidth * nextDpr) || canvas.height !== Math.round(nextHeight * nextDpr)) {
 			dpr = nextDpr;
@@ -457,75 +532,22 @@
 			canvas.width = Math.round(viewWidth * dpr);
 			canvas.height = Math.round(viewHeight * dpr);
 		}
+		videoRect = {
+			x: (nextWidth - videoWidth) / 2,
+			y: (nextHeight - videoHeight) / 2,
+			width: videoWidth,
+			height: videoHeight,
+		};
 
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		canvasNeedsResize = false;
 		markCanvasDirty();
 	}
 
-	function drawTrail(id, color, mediaMs, isLocal, liveEnd) {
-		const buffer = sampleBuffers.get(id) || [];
-		const start = mediaMs - config.trailMs;
-		let startIndex = 0;
-		while (startIndex < buffer.length && buffer[startIndex].mediaMs < start) {
-			startIndex += 1;
-		}
-		if (startIndex >= buffer.length && !liveEnd) {
-			return;
-		}
-
-		ctx.strokeStyle = color;
-		ctx.lineCap = "round";
-		ctx.lineJoin = "round";
-
-		let previous = null;
-		for (let index = startIndex; index < buffer.length; index += 1) {
-			const point = buffer[index];
-			if (point.mediaMs > mediaMs) {
-				break;
-			}
-			if (previous) {
-				drawTrailSegment(previous, point, mediaMs, isLocal);
-			}
-			previous = point;
-		}
-		if (liveEnd) {
-			const livePoint = {
-				x: liveEnd.x,
-				y: liveEnd.y,
-				mediaMs,
-			};
-			if (previous) {
-				drawTrailSegment(previous, livePoint, mediaMs, isLocal);
-			}
-			previous = livePoint;
-		}
-		if (previous) {
-			const head = clamp01(1 - (mediaMs - previous.mediaMs) / Math.max(1, config.trailMs));
-			ctx.globalAlpha = (isLocal ? 0.26 : 0.2) * head;
-			ctx.fillStyle = color;
-			ctx.beginPath();
-			ctx.arc(previous.x * viewWidth, previous.y * viewHeight, (isLocal ? 3.5 : 3) * head, 0, Math.PI * 2);
-			ctx.fill();
-		}
-		ctx.globalAlpha = 1;
-	}
-
-	function drawTrailSegment(a, b, mediaMs, isLocal) {
-		const freshness = clamp01(1 - (mediaMs - b.mediaMs) / Math.max(1, config.trailMs));
-		const headWidth = isLocal ? 9 : 7;
-		const tailWidth = 1.2;
-		ctx.globalAlpha = (isLocal ? 0.34 : 0.26) * freshness;
-		ctx.lineWidth = tailWidth + (headWidth - tailWidth) * freshness;
-		ctx.beginPath();
-		ctx.moveTo(a.x * viewWidth, a.y * viewHeight);
-		ctx.lineTo(b.x * viewWidth, b.y * viewHeight);
-		ctx.stroke();
-	}
-
 	function drawDot(position, color, isLocal) {
-		const x = position.x * viewWidth;
-		const y = position.y * viewHeight;
+		const point = normalizedToCanvas(position);
+		const x = point.x;
+		const y = point.y;
 		const radius = 14;
 
 		ctx.globalAlpha = position.stale ? 0.72 : 1;
@@ -547,6 +569,7 @@
 		debugStatusEl.textContent = socketStatus;
 		debugOffsetEl.textContent = `${Math.round(clockOffsetMs)} ms`;
 		debugRttEl.textContent = rttMs === null ? "-" : `${Math.round(rttMs)} ms`;
+		debugSendHzEl.textContent = currentSendHz().toFixed(1);
 		debugMediaEl.textContent = `${(mediaMs / 1000).toFixed(2)} s`;
 	}
 
@@ -557,6 +580,7 @@
 		}
 
 		const mediaMs = displayedMediaMs();
+		syncVideo(mediaMs);
 		maybeSendMove(false);
 
 		const counterText = String(Math.floor(mediaMs / 1000));
@@ -571,7 +595,7 @@
 		}
 
 		const targetRenderHz = Math.max(15, Math.min(60, config.renderHz || 30));
-		const shouldDrawCanvas = canvasDirty || canvasNeedsFinalClean || mediaMs <= canvasDirtyUntilMediaMs;
+		const shouldDrawCanvas = canvasDirty || mediaMs <= canvasDirtyUntilMediaMs;
 		if (!shouldDrawCanvas || now < nextCanvasDrawAt) {
 			requestAnimationFrame(render);
 			return;
@@ -579,14 +603,7 @@
 		nextCanvasDrawAt = now + 1000 / targetRenderHz;
 
 		pruneSamples(mediaMs);
-		ctx.fillStyle = "#090a0f";
-		ctx.fillRect(0, 0, viewWidth, viewHeight);
-
-		for (const [id, player] of players) {
-			if (player.started) {
-				drawTrail(id, player.color, mediaMs, id === playerId, id === playerId && localStarted ? localPreview : null);
-			}
-		}
+		ctx.clearRect(0, 0, viewWidth, viewHeight);
 
 		for (const [id, player] of players) {
 			if (id !== playerId && player.started) {
@@ -598,12 +615,12 @@
 			drawDot({ ...localPreview, stale: false }, localColor, true);
 		}
 		canvasDirty = false;
-		canvasNeedsFinalClean = mediaMs <= canvasDirtyUntilMediaMs;
 		requestAnimationFrame(render);
 	}
 
 	canvas.addEventListener("pointerdown", (event) => {
 		event.preventDefault();
+		video.play().catch(() => {});
 		const wasStarted = localStarted;
 		activePointerId = event.pointerId;
 		pointerUpdatedDuringActive = false;
@@ -642,6 +659,11 @@
 
 	canvas.addEventListener("pointerup", endPointer);
 	canvas.addEventListener("pointercancel", endPointer);
+	video.addEventListener("loadedmetadata", () => {
+		syncVideo(displayedMediaMs());
+		markCanvasDirty();
+	});
+	video.addEventListener("play", markCanvasDirty);
 	window.addEventListener("resize", () => {
 		canvasNeedsResize = true;
 		markCanvasDirty();
