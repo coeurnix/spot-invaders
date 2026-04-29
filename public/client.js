@@ -2,6 +2,7 @@
 	const params = new URLSearchParams(location.search);
 	const roomId = params.get("room") || "default";
 	const video = document.getElementById("media");
+	const hitOverlayEl = document.getElementById("hit-overlay");
 	const canvas = document.getElementById("stage");
 	const ctx = canvas.getContext("2d", { alpha: true });
 	const counterEl = document.getElementById("counter");
@@ -29,6 +30,10 @@
 		fullRatePlayerCount: 10,
 		minRatePlayerCount: 100,
 		renderHz: 30,
+		energyChargeMs: 3000,
+		energyRechargeMs: 5000,
+		energyBlastImmunityMs: 5000,
+		energyBlastRadiusPlayerScale: 10,
 	};
 
 	const videoAspect = 1280 / 720;
@@ -61,6 +66,13 @@
 	let activePointerId = null;
 	let pointerUpdatedDuringActive = false;
 	let lastPointerSample = null;
+	let energyPointerId = null;
+	let mustReleaseBeforeCharge = false;
+	let localEnergyRechargeUntilServerMs = 0;
+	let localBlastImmuneUntilServerMs = 0;
+	let hitEffectStartedAt = 0;
+	let hitEffectUntil = 0;
+	let hitEffectSeed = 0;
 	let lastCounterText = "";
 	let lastDebugUpdateAt = 0;
 	let lastVideoSyncAt = 0;
@@ -80,6 +92,8 @@
 
 	const players = new Map();
 	const sampleBuffers = new Map();
+	const activeBlasts = [];
+	const seenBlastIds = new Set();
 	const localPreview = {
 		x: 0.5,
 		y: 0.5,
@@ -92,6 +106,43 @@
 
 	function clamp01(value) {
 		return Math.min(1, Math.max(0, value));
+	}
+
+	function energyChargeMs() {
+		return Math.max(500, config.energyChargeMs || defaultConfig.energyChargeMs);
+	}
+
+	function energyRechargeMs() {
+		return Math.max(0, config.energyRechargeMs || defaultConfig.energyRechargeMs);
+	}
+
+	function energyBlastImmunityMs() {
+		return Math.max(0, config.energyBlastImmunityMs || defaultConfig.energyBlastImmunityMs);
+	}
+
+	function energyBlastRadiusScale() {
+		return Math.max(1, config.energyBlastRadiusPlayerScale || defaultConfig.energyBlastRadiusPlayerScale);
+	}
+
+	function videoUnitPx() {
+		return Math.max(1, Math.min(videoRect.width, videoRect.height));
+	}
+
+	function playerRadiusPx() {
+		return Math.max(5, videoUnitPx() * 0.0195);
+	}
+
+	function blastRadiusPx() {
+		return playerRadiusPx() * energyBlastRadiusScale();
+	}
+
+	function syncVideoCssVars() {
+		const root = document.documentElement;
+		root.style.setProperty("--video-left", `${videoRect.x}px`);
+		root.style.setProperty("--video-top", `${videoRect.y}px`);
+		root.style.setProperty("--video-width", `${videoRect.width}px`);
+		root.style.setProperty("--video-height", `${videoRect.height}px`);
+		root.style.setProperty("--video-unit", `${videoUnitPx()}px`);
 	}
 
 	function cssColorToPortalColor(color) {
@@ -336,6 +387,14 @@
 			handleRoomStarted(message);
 		} else if (message.type === "move") {
 			handleMove(message);
+		} else if (message.type === "energy_start") {
+			handleEnergyStart(message);
+		} else if (message.type === "energy_cancel") {
+			handleEnergyCancel(message);
+		} else if (message.type === "energy_blast") {
+			handleEnergyBlast(message);
+		} else if (message.type === "energy_state") {
+			handleEnergyState(message);
 		} else if (message.type === "pong") {
 			handlePong(message);
 		}
@@ -357,6 +416,12 @@
 		reconnectDelayMs = 250;
 		players.clear();
 		sampleBuffers.clear();
+		activeBlasts.length = 0;
+		seenBlastIds.clear();
+		localEnergyRechargeUntilServerMs = 0;
+		localBlastImmuneUntilServerMs = 0;
+		mustReleaseBeforeCharge = false;
+		energyPointerId = null;
 
 		for (const player of message.players || []) {
 			upsertPlayer(player);
@@ -377,6 +442,7 @@
 			localPreview.y = local.y;
 			localPreview.vx = local.vx || 0;
 			localPreview.vy = local.vy || 0;
+			localEnergyRechargeUntilServerMs = local.energyRechargeUntilServerMs || 0;
 		}
 
 		updatePortalLink();
@@ -476,6 +542,15 @@
 			lastSeq: Number.isFinite(player.lastSeq) ? player.lastSeq : existing?.lastSeq || 0,
 			lastMediaMs: Number.isFinite(player.lastMediaMs) ? player.lastMediaMs : existing?.lastMediaMs || 0,
 			started: Boolean(player.started ?? existing?.started),
+			energyChargeStartedServerMs: Number.isFinite(player.energyChargeStartedServerMs)
+				? player.energyChargeStartedServerMs
+				: player.energyChargeStartedServerMs === null
+					? null
+					: existing?.energyChargeStartedServerMs ?? null,
+			energyRechargeUntilServerMs: Number.isFinite(player.energyRechargeUntilServerMs)
+				? player.energyRechargeUntilServerMs
+				: existing?.energyRechargeUntilServerMs || 0,
+			energyBlastSeq: Number.isFinite(player.energyBlastSeq) ? player.energyBlastSeq : existing?.energyBlastSeq || 0,
 		});
 	}
 
@@ -494,6 +569,9 @@
 			lastSeq: 0,
 			lastMediaMs: 0,
 			started: false,
+			energyChargeStartedServerMs: null,
+			energyRechargeUntilServerMs: 0,
+			energyBlastSeq: 0,
 		};
 
 		if (message.seq <= player.lastSeq) {
@@ -521,6 +599,143 @@
 			seq: player.lastSeq,
 		});
 		markCanvasDirty(player.lastMediaMs + currentMaxExtrapolateMs());
+	}
+
+	function playerForEnergyMessage(message) {
+		if (!message.playerId) {
+			return null;
+		}
+
+		const player = players.get(message.playerId) || {
+			playerId: message.playerId,
+			color: message.color || "#ffffff",
+			x: Number.isFinite(message.x) ? message.x : 0.5,
+			y: Number.isFinite(message.y) ? message.y : 0.5,
+			vx: 0,
+			vy: 0,
+			lastSeq: 0,
+			lastMediaMs: 0,
+			started: true,
+			energyChargeStartedServerMs: null,
+			energyRechargeUntilServerMs: 0,
+			energyBlastSeq: 0,
+		};
+		players.set(player.playerId, player);
+		return player;
+	}
+
+	function handleEnergyStart(message) {
+		const player = playerForEnergyMessage(message);
+		if (!player || !Number.isFinite(message.chargeStartedServerMs)) {
+			return;
+		}
+
+		player.energyChargeStartedServerMs = message.chargeStartedServerMs;
+		player.energyRechargeUntilServerMs = Number.isFinite(message.rechargeUntilServerMs)
+			? message.rechargeUntilServerMs
+			: player.energyRechargeUntilServerMs || 0;
+		if (Number.isFinite(message.serverNowMs)) {
+			const sampleOffset = message.serverNowMs - performance.now();
+			clockOffsetMs = clockOffsetMs * 0.9 + sampleOffset * 0.1;
+		}
+		if (player.playerId === playerId) {
+			localEnergyRechargeUntilServerMs = player.energyRechargeUntilServerMs;
+		}
+		markCanvasDirty(displayedMediaMs() + energyChargeMs() + 500);
+	}
+
+	function handleEnergyCancel(message) {
+		const player = playerForEnergyMessage(message);
+		if (!player) {
+			return;
+		}
+
+		player.energyChargeStartedServerMs = null;
+		if (player.playerId === playerId) {
+			energyPointerId = null;
+		}
+		markCanvasDirty();
+	}
+
+	function handleEnergyState(message) {
+		const player = playerForEnergyMessage(message);
+		if (!player) {
+			return;
+		}
+
+		player.energyChargeStartedServerMs = Number.isFinite(message.energyChargeStartedServerMs)
+			? message.energyChargeStartedServerMs
+			: null;
+		player.energyRechargeUntilServerMs = Number.isFinite(message.energyRechargeUntilServerMs)
+			? message.energyRechargeUntilServerMs
+			: player.energyRechargeUntilServerMs || 0;
+		if (player.playerId === playerId) {
+			localEnergyRechargeUntilServerMs = player.energyRechargeUntilServerMs;
+		}
+		markCanvasDirty();
+	}
+
+	function handleEnergyBlast(message) {
+		const player = playerForEnergyMessage(message);
+		if (
+			!player ||
+			!message.blastId ||
+			!Number.isFinite(message.blastServerMs) ||
+			!Number.isFinite(message.x) ||
+			!Number.isFinite(message.y)
+		) {
+			return;
+		}
+		if (seenBlastIds.has(message.blastId)) {
+			return;
+		}
+		seenBlastIds.add(message.blastId);
+		if (seenBlastIds.size > 100) {
+			seenBlastIds.delete(seenBlastIds.values().next().value);
+		}
+
+		player.energyChargeStartedServerMs = null;
+		player.energyRechargeUntilServerMs = Number.isFinite(message.rechargeUntilServerMs)
+			? message.rechargeUntilServerMs
+			: message.blastServerMs + energyRechargeMs();
+		if (player.playerId === playerId) {
+			localEnergyRechargeUntilServerMs = player.energyRechargeUntilServerMs;
+			mustReleaseBeforeCharge = energyPointerId !== null;
+		}
+
+		activeBlasts.push({
+			id: message.blastId,
+			playerId: player.playerId,
+			x: clamp01(message.x),
+			y: clamp01(message.y),
+			color: message.color || player.color,
+			blastServerMs: message.blastServerMs,
+		});
+		if (activeBlasts.length > 32) {
+			activeBlasts.splice(0, activeBlasts.length - 32);
+		}
+
+		if (player.playerId !== playerId) {
+			maybeApplyBlastHit(message);
+		}
+		markCanvasDirty(displayedMediaMs() + 1500);
+	}
+
+	function maybeApplyBlastHit(blast) {
+		if (!isPlaying || !localStarted || estimatedServerNowMs() < localBlastImmuneUntilServerMs) {
+			return;
+		}
+
+		const dx = (localPreview.x - clamp01(blast.x)) * videoRect.width;
+		const dy = (localPreview.y - clamp01(blast.y)) * videoRect.height;
+		if (Math.hypot(dx, dy) > blastRadiusPx()) {
+			return;
+		}
+
+		localBlastImmuneUntilServerMs = blast.blastServerMs + energyBlastImmunityMs();
+		hitEffectStartedAt = performance.now();
+		hitEffectUntil = hitEffectStartedAt + 3000;
+		hitEffectSeed = Math.random() * 1000;
 	}
 
 	function pushSample(id, sample) {
@@ -659,6 +874,57 @@
 		);
 	}
 
+	function canStartEnergyCharge() {
+		return (
+			isPlaying &&
+			localStarted &&
+			playerId &&
+			ws?.readyState === WebSocket.OPEN &&
+			!mustReleaseBeforeCharge &&
+			estimatedServerNowMs() >= localEnergyRechargeUntilServerMs
+		);
+	}
+
+	function beginEnergyCharge(event) {
+		if (event.pointerType !== "mouse" || event.button !== 0 || !canStartEnergyCharge()) {
+			return;
+		}
+
+		const local = players.get(playerId);
+		if (local?.energyChargeStartedServerMs !== null && local?.energyChargeStartedServerMs !== undefined) {
+			return;
+		}
+
+		energyPointerId = event.pointerId;
+		const chargeStartedServerMs = estimatedServerNowMs();
+		if (local) {
+			local.energyChargeStartedServerMs = chargeStartedServerMs;
+			local.energyRechargeUntilServerMs = localEnergyRechargeUntilServerMs;
+		}
+		ws.send(JSON.stringify({ type: "energy_start" }));
+		markCanvasDirty(displayedMediaMs() + energyChargeMs() + 500);
+	}
+
+	function endEnergyCharge(event) {
+		if (event.pointerId !== energyPointerId) {
+			return;
+		}
+
+		const local = players.get(playerId);
+		const chargeStartedServerMs = local?.energyChargeStartedServerMs;
+		if (Number.isFinite(chargeStartedServerMs)) {
+			const elapsedMs = estimatedServerNowMs() - chargeStartedServerMs;
+			if (elapsedMs < energyChargeMs() - 80 && ws?.readyState === WebSocket.OPEN) {
+				ws.send(JSON.stringify({ type: "energy_cancel" }));
+				local.energyChargeStartedServerMs = null;
+				markCanvasDirty();
+			}
+		}
+
+		energyPointerId = null;
+		mustReleaseBeforeCharge = false;
+	}
+
 	function resizeCanvas() {
 		const rect = canvas.getBoundingClientRect();
 		const nextDpr = 1;
@@ -688,20 +954,51 @@
 			width: videoWidth,
 			height: videoHeight,
 		};
+		syncVideoCssVars();
 
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		canvasNeedsResize = false;
 		markCanvasDirty();
 	}
 
-	function drawDot(position, color, isLocal) {
+	function drawChargeOutline(position, player, serverNowMs) {
+		if (!Number.isFinite(player.energyChargeStartedServerMs)) {
+			return;
+		}
+
+		const elapsedMs = serverNowMs - player.energyChargeStartedServerMs;
+		if (elapsedMs < 0 || elapsedMs > energyChargeMs() + 300) {
+			return;
+		}
+
+		const point = normalizedToCanvas(position);
+		const progress = clamp01(elapsedMs / energyChargeMs());
+		const pulse = (Math.sin(performance.now() / 90) + 1) / 2;
+		const radius = playerRadiusPx() * (1.55 + progress * 0.5 + pulse * 0.18);
+		const hue = (elapsedMs / 8 + progress * 160) % 360;
+
+		ctx.save();
+		ctx.globalAlpha = 0.62 + pulse * 0.28;
+		ctx.lineWidth = Math.max(2, playerRadiusPx() * (0.14 + progress * 0.08));
+		ctx.strokeStyle = `hsl(${hue}, 100%, ${62 + pulse * 18}%)`;
+		ctx.shadowColor = ctx.strokeStyle;
+		ctx.shadowBlur = playerRadiusPx() * (1.2 + progress * 1.2);
+		ctx.beginPath();
+		ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+		ctx.stroke();
+		ctx.restore();
+	}
+
+	function drawDot(position, player, isLocal, serverNowMs) {
 		const point = normalizedToCanvas(position);
 		const x = point.x;
 		const y = point.y;
-		const radius = 14;
+		const radius = playerRadiusPx();
+		const color = player.color;
 
+		drawChargeOutline(position, player, serverNowMs);
 		ctx.globalAlpha = position.stale ? 0.72 : 1;
-		ctx.lineWidth = isLocal ? 2 : 4;
+		ctx.lineWidth = Math.max(1.5, radius * (isLocal ? 0.14 : 0.26));
 		ctx.strokeStyle = isLocal ? "rgba(255, 255, 255, 0.9)" : color;
 		ctx.fillStyle = isLocal ? color : "rgba(255, 255, 255, 0.02)";
 		ctx.beginPath();
@@ -711,6 +1008,73 @@
 		}
 		ctx.stroke();
 		ctx.globalAlpha = 1;
+	}
+
+	function drawBlast(blast, serverNowMs) {
+		const elapsedMs = serverNowMs - blast.blastServerMs;
+		const durationMs = 950;
+		if (elapsedMs < -100 || elapsedMs > durationMs) {
+			return false;
+		}
+
+		const progress = clamp01(elapsedMs / durationMs);
+		const point = normalizedToCanvas(blast);
+		const radius = playerRadiusPx() + (blastRadiusPx() - playerRadiusPx()) * progress;
+		const alpha = (1 - progress) ** 0.65;
+
+		ctx.save();
+		ctx.globalAlpha = alpha;
+		ctx.lineWidth = Math.max(2, playerRadiusPx() * (0.4 - progress * 0.18));
+		ctx.strokeStyle = blast.color;
+		ctx.shadowColor = blast.color;
+		ctx.shadowBlur = playerRadiusPx() * (3.2 - progress * 1.5);
+		ctx.beginPath();
+		ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+		ctx.stroke();
+
+		ctx.globalAlpha = alpha * 0.18;
+		ctx.fillStyle = blast.color;
+		ctx.beginPath();
+		ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+		ctx.fill();
+		ctx.restore();
+		return true;
+	}
+
+	function hasActiveEnergyEffects(serverNowMs) {
+		for (const player of players.values()) {
+			if (
+				Number.isFinite(player.energyChargeStartedServerMs) &&
+				serverNowMs - player.energyChargeStartedServerMs <= energyChargeMs() + 300
+			) {
+				return true;
+			}
+		}
+
+		return activeBlasts.some((blast) => serverNowMs - blast.blastServerMs <= 950);
+	}
+
+	function updateHitEffect(now) {
+		if (now >= hitEffectUntil) {
+			video.style.setProperty("--shake-x", "0px");
+			video.style.setProperty("--shake-y", "0px");
+			video.style.filter = "";
+			hitOverlayEl.style.opacity = "0";
+			return;
+		}
+
+		const durationMs = Math.max(1, hitEffectUntil - hitEffectStartedAt);
+		const progress = clamp01((now - hitEffectStartedAt) / durationMs);
+		const intensity = (1 - progress) ** 1.35;
+		const amplitude = videoUnitPx() * 0.024 * intensity;
+		const phase = (now + hitEffectSeed) / 22;
+		const shakeX = Math.sin(phase * 1.7) * amplitude + Math.sin(phase * 0.63) * amplitude * 0.45;
+		const shakeY = Math.cos(phase * 1.3) * amplitude + Math.sin(phase * 0.91) * amplitude * 0.4;
+
+		video.style.setProperty("--shake-x", `${shakeX.toFixed(2)}px`);
+		video.style.setProperty("--shake-y", `${shakeY.toFixed(2)}px`);
+		video.style.filter = `brightness(${Math.max(0.48, 1 - intensity * 0.42).toFixed(3)})`;
+		hitOverlayEl.style.opacity = (intensity * 0.48).toFixed(3);
 	}
 
 	function updateDebug(mediaMs) {
@@ -748,6 +1112,8 @@
 		syncVideo(mediaMs);
 		maybeSendMove(false);
 		updateHud(now);
+		updateHitEffect(now);
+		const serverNowMs = estimatedServerNowMs();
 
 		const counterText = String(Math.floor(mediaMs / 1000));
 		if (counterText !== lastCounterText) {
@@ -761,7 +1127,7 @@
 		}
 
 		const targetRenderHz = Math.max(15, Math.min(60, config.renderHz || 30));
-		const shouldDrawCanvas = canvasDirty || mediaMs <= canvasDirtyUntilMediaMs;
+		const shouldDrawCanvas = canvasDirty || mediaMs <= canvasDirtyUntilMediaMs || hasActiveEnergyEffects(serverNowMs);
 		if (!shouldDrawCanvas || now < nextCanvasDrawAt) {
 			requestAnimationFrame(render);
 			return;
@@ -769,16 +1135,31 @@
 		nextCanvasDrawAt = now + 1000 / targetRenderHz;
 
 		pruneSamples(mediaMs);
+		for (let index = activeBlasts.length - 1; index >= 0; index -= 1) {
+			if (serverNowMs - activeBlasts[index].blastServerMs > 1000) {
+				activeBlasts.splice(index, 1);
+			}
+		}
 		ctx.clearRect(0, 0, viewWidth, viewHeight);
+
+		for (const blast of activeBlasts) {
+			drawBlast(blast, serverNowMs);
+		}
 
 		for (const [id, player] of players) {
 			if (id !== playerId && player.started) {
-				drawDot(reconstruct(id, mediaMs), player.color, false);
+				drawDot(reconstruct(id, mediaMs), player, false, serverNowMs);
 			}
 		}
 
 		if (playerId && localStarted) {
-			drawDot({ ...localPreview, stale: false }, localColor, true);
+			const local = players.get(playerId) || {
+				playerId,
+				color: localColor,
+				energyChargeStartedServerMs: null,
+				energyRechargeUntilServerMs: localEnergyRechargeUntilServerMs,
+			};
+			drawDot({ ...localPreview, stale: false }, local, true, serverNowMs);
 		}
 		canvasDirty = false;
 		requestAnimationFrame(render);
@@ -795,6 +1176,8 @@
 			pointerUpdatedDuringActive = true;
 			beginPlaying();
 			maybeSendMove(true);
+		} else {
+			beginEnergyCharge(event);
 		}
 	});
 
@@ -824,6 +1207,7 @@
 			return;
 		}
 		event.preventDefault();
+		endEnergyCharge(event);
 		if (pointerUpdatedDuringActive || event.pointerType !== "mouse") {
 			updatePointer(event, false);
 			maybeSendMove(true);

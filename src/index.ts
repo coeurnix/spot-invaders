@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 
 type Session = LatestPlayerState & {
 	ws: WebSocket;
+	energyTimer: ReturnType<typeof setTimeout> | null;
 };
 
 type LatestPlayerState = {
@@ -14,6 +15,9 @@ type LatestPlayerState = {
 	lastSeq: number;
 	lastMediaMs: number;
 	started: boolean;
+	energyChargeStartedServerMs: number | null;
+	energyRechargeUntilServerMs: number;
+	energyBlastSeq: number;
 };
 
 const ROOM_CONFIG = {
@@ -26,6 +30,10 @@ const ROOM_CONFIG = {
 	fullRatePlayerCount: 10,
 	minRatePlayerCount: 100,
 	renderHz: 30,
+	energyChargeMs: 3000,
+	energyRechargeMs: 5000,
+	energyBlastImmunityMs: 5000,
+	energyBlastRadiusPlayerScale: 10,
 };
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
@@ -42,6 +50,9 @@ const playerSnapshot = (session: Session): LatestPlayerState => ({
 	lastSeq: session.lastSeq,
 	lastMediaMs: session.lastMediaMs,
 	started: session.started,
+	energyChargeStartedServerMs: session.energyChargeStartedServerMs,
+	energyRechargeUntilServerMs: session.energyRechargeUntilServerMs,
+	energyBlastSeq: session.energyBlastSeq,
 });
 
 export class MyDurableObject extends DurableObject {
@@ -84,6 +95,10 @@ export class MyDurableObject extends DurableObject {
 			lastSeq: 0,
 			lastMediaMs: 0,
 			started: false,
+			energyChargeStartedServerMs: null,
+			energyRechargeUntilServerMs: 0,
+			energyBlastSeq: 0,
+			energyTimer: null,
 		};
 
 		this.sessions.set(server, session);
@@ -146,6 +161,16 @@ export class MyDurableObject extends DurableObject {
 
 		if (data.type === "move") {
 			this.handleMove(ws, session, data);
+			return;
+		}
+
+		if (data.type === "energy_start") {
+			this.handleEnergyStart(session);
+			return;
+		}
+
+		if (data.type === "energy_cancel") {
+			this.handleEnergyCancel(session);
 		}
 	}
 
@@ -229,6 +254,101 @@ export class MyDurableObject extends DurableObject {
 		});
 	}
 
+	private handleEnergyStart(session: Session): void {
+		if (!session.started || session.energyChargeStartedServerMs !== null) {
+			return;
+		}
+
+		const now = Date.now();
+		if (now < session.energyRechargeUntilServerMs) {
+			this.safeSend(session.ws, {
+				type: "energy_state",
+				playerId: session.playerId,
+				energyChargeStartedServerMs: session.energyChargeStartedServerMs,
+				energyRechargeUntilServerMs: session.energyRechargeUntilServerMs,
+				serverNowMs: now,
+			});
+			return;
+		}
+
+		session.energyChargeStartedServerMs = now;
+		this.latestByPlayer.set(session.playerId, playerSnapshot(session));
+		this.clearEnergyTimer(session);
+		session.energyTimer = setTimeout(() => {
+			this.releaseEnergyBlast(session.playerId);
+		}, ROOM_CONFIG.energyChargeMs);
+
+		this.broadcast({
+			type: "energy_start",
+			playerId: session.playerId,
+			chargeStartedServerMs: now,
+			rechargeUntilServerMs: session.energyRechargeUntilServerMs,
+			serverNowMs: now,
+		});
+	}
+
+	private handleEnergyCancel(session: Session): void {
+		if (session.energyChargeStartedServerMs === null) {
+			return;
+		}
+
+		const now = Date.now();
+		if (now - session.energyChargeStartedServerMs >= ROOM_CONFIG.energyChargeMs - 80) {
+			return;
+		}
+
+		this.clearEnergyTimer(session);
+		session.energyChargeStartedServerMs = null;
+		this.latestByPlayer.set(session.playerId, playerSnapshot(session));
+		this.broadcast({
+			type: "energy_cancel",
+			playerId: session.playerId,
+			serverNowMs: now,
+		});
+	}
+
+	private releaseEnergyBlast(playerId: string): void {
+		const session = [...this.sessions.values()].find((candidate) => candidate.playerId === playerId);
+		if (!session || session.energyChargeStartedServerMs === null) {
+			return;
+		}
+
+		const now = Date.now();
+		const elapsedMs = now - session.energyChargeStartedServerMs;
+		if (elapsedMs < ROOM_CONFIG.energyChargeMs - 80) {
+			this.clearEnergyTimer(session);
+			session.energyTimer = setTimeout(() => {
+				this.releaseEnergyBlast(session.playerId);
+			}, Math.max(0, ROOM_CONFIG.energyChargeMs - elapsedMs));
+			return;
+		}
+
+		this.clearEnergyTimer(session);
+		session.energyChargeStartedServerMs = null;
+		session.energyRechargeUntilServerMs = now + ROOM_CONFIG.energyRechargeMs;
+		session.energyBlastSeq += 1;
+		this.latestByPlayer.set(session.playerId, playerSnapshot(session));
+
+		this.broadcast({
+			type: "energy_blast",
+			playerId: session.playerId,
+			blastId: `${session.playerId}:${session.energyBlastSeq}`,
+			blastServerMs: now,
+			rechargeUntilServerMs: session.energyRechargeUntilServerMs,
+			x: session.x,
+			y: session.y,
+			color: session.color,
+			serverNowMs: now,
+		});
+	}
+
+	private clearEnergyTimer(session: Session): void {
+		if (session.energyTimer !== null) {
+			clearTimeout(session.energyTimer);
+			session.energyTimer = null;
+		}
+	}
+
 	private safeSend(ws: WebSocket, data: unknown): boolean {
 		const encoded = typeof data === "string" ? data : JSON.stringify(data);
 		try {
@@ -262,6 +382,7 @@ export class MyDurableObject extends DurableObject {
 
 		this.sessions.delete(ws);
 		this.latestByPlayer.delete(session.playerId);
+		this.clearEnergyTimer(session);
 
 		this.broadcast({
 			type: "player_left",
