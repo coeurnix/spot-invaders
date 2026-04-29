@@ -5,6 +5,11 @@
 	const canvas = document.getElementById("stage");
 	const ctx = canvas.getContext("2d", { alpha: true });
 	const counterEl = document.getElementById("counter");
+	const scoreEl = document.getElementById("score");
+	const playerCountEl = document.getElementById("player-count");
+	const titleScreenEl = document.getElementById("title-screen");
+	const gameOverLabelEl = document.getElementById("game-over-label");
+	const portalLinkEl = document.getElementById("portal-link");
 	const debugRoomEl = document.getElementById("debug-room");
 	const debugPlayersEl = document.getElementById("debug-players");
 	const debugPlayerEl = document.getElementById("debug-player");
@@ -23,10 +28,13 @@
 		maxSendHz: 10,
 		fullRatePlayerCount: 10,
 		minRatePlayerCount: 100,
-		renderHz: 24,
+		renderHz: 30,
 	};
 
 	const videoAspect = 1280 / 720;
+	const portalRef = params.get("ref") || "";
+	const fromPortal = params.get("portal") === "true";
+	const portalSpawn = { x: 0.12, y: 0.5 };
 
 	let ws = null;
 	let socketStatus = "idle";
@@ -45,6 +53,11 @@
 	let lastSentAt = 0;
 	let localDirty = false;
 	let localStarted = false;
+	let isPlaying = false;
+	let isGameOver = false;
+	let scoreStartedAt = 0;
+	let lastScoreText = "";
+	let pendingStartPoint = null;
 	let activePointerId = null;
 	let pointerUpdatedDuringActive = false;
 	let lastPointerSample = null;
@@ -75,9 +88,67 @@
 	};
 
 	debugRoomEl.textContent = roomId;
+	gameOverLabelEl.hidden = true;
 
 	function clamp01(value) {
 		return Math.min(1, Math.max(0, value));
+	}
+
+	function cssColorToPortalColor(color) {
+		const hslMatch = /^hsl\(\s*(\d+(?:\.\d+)?)/i.exec(color);
+		if (hslMatch) {
+			return `hsl-${Math.round(Number(hslMatch[1]))}`;
+		}
+		return color || "cyan";
+	}
+
+	function portalParams() {
+		const outbound = new URLSearchParams(location.search);
+		outbound.delete("portal");
+		outbound.set("username", playerId ? `spot-${playerId.slice(0, 6)}` : "spot-player");
+		outbound.set("color", cssColorToPortalColor(localColor));
+		outbound.set("speed", Math.hypot(localPreview.vx, localPreview.vy).toFixed(2));
+		outbound.set("ref", "spot-invaders.coeurnix.party");
+		return outbound;
+	}
+
+	function updatePortalLink() {
+		if (fromPortal && portalRef) {
+			const url = new URL(/^https?:\/\//i.test(portalRef) ? portalRef : `https://${portalRef}`);
+			const existing = new URLSearchParams(location.search);
+			for (const [key, value] of existing) {
+				if (key !== "portal" && key !== "ref") {
+					url.searchParams.set(key, value);
+				}
+			}
+			url.searchParams.set("portal", "true");
+			url.searchParams.set("ref", "spot-invaders.coeurnix.party");
+			portalLinkEl.href = url.toString();
+			portalLinkEl.textContent = "Return Portal";
+			return;
+		}
+
+		portalLinkEl.href = `https://vibejam.cc/portal/2026?${portalParams().toString()}`;
+		portalLinkEl.textContent = "Vibe Jam Portal";
+	}
+
+	function setOverlayVisible(visible) {
+		titleScreenEl.classList.toggle("has-return-portal", Boolean(fromPortal && portalRef));
+		titleScreenEl.classList.toggle("is-hidden", !visible);
+		gameOverLabelEl.hidden = !isGameOver;
+	}
+
+	function beginPlaying() {
+		if (!isPlaying) {
+			scoreStartedAt = performance.now();
+			lastScoreText = "";
+		}
+		isPlaying = true;
+		isGameOver = false;
+		setOverlayVisible(false);
+		if (roomStartServerMs !== null) {
+			video.play().catch(() => {});
+		}
 	}
 
 	function pointToVideoSpace(clientX, clientY) {
@@ -130,17 +201,55 @@
 		return Math.max(config.maxExtrapolateMs || 250, 1000 / currentSendHz() + 120);
 	}
 
-	function syncVideo(mediaMs) {
+	function mediaClockSeconds(mediaMs) {
+		if (!video.duration || !Number.isFinite(video.duration)) {
+			return 0;
+		}
+
+		const duration = video.duration;
+		return ((mediaMs / 1000) % duration + duration) % duration;
+	}
+
+	function videoDriftSeconds(targetSeconds) {
+		const duration = video.duration;
+		let drift = targetSeconds - video.currentTime;
+		if (duration && Number.isFinite(duration)) {
+			if (drift > duration / 2) {
+				drift -= duration;
+			} else if (drift < -duration / 2) {
+				drift += duration;
+			}
+		}
+		return drift;
+	}
+
+	function syncVideo(mediaMs, force = false) {
+		if (roomStartServerMs === null) {
+			video.playbackRate = 1;
+			if (!video.paused) {
+				video.pause();
+			}
+			if (video.duration && Number.isFinite(video.duration) && !video.seeking && video.currentTime !== 0) {
+				video.currentTime = 0;
+			}
+			return;
+		}
+
 		const now = performance.now();
-		if (now - lastVideoSyncAt < 250 || !video.duration || !Number.isFinite(video.duration)) {
+		if (!video.duration || !Number.isFinite(video.duration)) {
+			return;
+		}
+		if (!force && now - lastVideoSyncAt < 100) {
 			return;
 		}
 		lastVideoSyncAt = now;
 
-		const targetSeconds = (mediaMs / 1000) % video.duration;
-		if (!video.seeking && Math.abs(video.currentTime - targetSeconds) > 0.35) {
+		const targetSeconds = mediaClockSeconds(mediaMs);
+		const drift = videoDriftSeconds(targetSeconds);
+		if (!video.seeking && (force || Math.abs(drift) > 0.08)) {
 			video.currentTime = targetSeconds;
 		}
+		video.playbackRate = Math.max(0.9, Math.min(1.1, 1 + drift * 0.35));
 		if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
 			video.play().catch(() => {
 				// Muted autoplay is normally allowed; if blocked, the next user gesture retries.
@@ -223,6 +332,8 @@
 			players.delete(message.playerId);
 			sampleBuffers.delete(message.playerId);
 			markCanvasDirty();
+		} else if (message.type === "room_started") {
+			handleRoomStarted(message);
 		} else if (message.type === "move") {
 			handleMove(message);
 		} else if (message.type === "pong") {
@@ -268,9 +379,39 @@
 			localPreview.vy = local.vy || 0;
 		}
 
+		updatePortalLink();
 		setStatus("synced");
 		markCanvasDirty();
 		startPing();
+		if (pendingStartPoint) {
+			startAtNormalizedPoint(pendingStartPoint, true);
+			pendingStartPoint = null;
+			beginPlaying();
+			maybeSendMove(true);
+			return;
+		}
+		if (fromPortal && !localStarted) {
+			startAtNormalizedPoint(portalSpawn, true);
+			beginPlaying();
+			maybeSendMove(true);
+		}
+	}
+
+	function handleRoomStarted(message) {
+		if (!Number.isFinite(message.roomStartServerMs)) {
+			return;
+		}
+
+		roomStartServerMs = message.roomStartServerMs;
+		if (Number.isFinite(message.epoch)) {
+			epoch = message.epoch;
+		}
+		if (Number.isFinite(message.serverNowMs)) {
+			const sampleOffset = message.serverNowMs - performance.now();
+			clockOffsetMs = clockOffsetMs * 0.8 + sampleOffset * 0.2;
+		}
+		syncVideo(displayedMediaMs(), true);
+		markCanvasDirty(displayedMediaMs() + currentMaxExtrapolateMs());
 	}
 
 	function handlePong(message) {
@@ -285,6 +426,38 @@
 		bestRttMs = Math.min(bestRttMs, rtt);
 		clockOffsetMs = clockOffsetMs * (1 - weight) + sampleOffset * weight;
 		rttMs = rtt;
+	}
+
+	function startAtNormalizedPoint(point, resetVelocity) {
+		const now = performance.now();
+		const x = clamp01(point.x);
+		const y = clamp01(point.y);
+
+		let vx = 0;
+		let vy = 0;
+		if (!resetVelocity && lastPointerSample) {
+			const dt = Math.max(1, now - lastPointerSample.t) / 1000;
+			vx = (x - lastPointerSample.x) / dt;
+			vy = (y - lastPointerSample.y) / dt;
+		}
+
+		localPreview.x = x;
+		localPreview.y = y;
+		localPreview.vx = vx;
+		localPreview.vy = vy;
+		lastPointerSample = { x, y, t: now };
+		localDirty = true;
+		localStarted = true;
+		markCanvasDirty();
+
+		const local = players.get(playerId);
+		if (local) {
+			local.x = x;
+			local.y = y;
+			local.vx = vx;
+			local.vy = vy;
+			local.started = true;
+		}
 	}
 
 	function upsertPlayer(player) {
@@ -448,36 +621,12 @@
 	}
 
 	function updatePointer(event, resetVelocity) {
-		const now = performance.now();
 		const point = pointToVideoSpace(event.clientX, event.clientY);
-		const x = point.x;
-		const y = point.y;
-
-		let vx = 0;
-		let vy = 0;
-		if (!resetVelocity && lastPointerSample) {
-			const dt = Math.max(1, now - lastPointerSample.t) / 1000;
-			vx = (x - lastPointerSample.x) / dt;
-			vy = (y - lastPointerSample.y) / dt;
+		if (!playerId) {
+			pendingStartPoint = point;
+			return;
 		}
-
-		localPreview.x = x;
-		localPreview.y = y;
-		localPreview.vx = vx;
-		localPreview.vy = vy;
-		lastPointerSample = { x, y, t: now };
-		localDirty = true;
-		localStarted = true;
-		markCanvasDirty();
-
-		const local = players.get(playerId);
-		if (local) {
-			local.x = x;
-			local.y = y;
-			local.vx = vx;
-			local.vy = vy;
-			local.started = true;
-		}
+		startAtNormalizedPoint(point, resetVelocity);
 	}
 
 	function maybeSendMove(force = false) {
@@ -495,6 +644,7 @@
 		seq += 1;
 		lastSentAt = now;
 		localDirty = false;
+		updatePortalLink();
 		ws.send(
 			JSON.stringify({
 				type: "move",
@@ -573,6 +723,21 @@
 		debugMediaEl.textContent = `${(mediaMs / 1000).toFixed(2)} s`;
 	}
 
+	function updateHud(now) {
+		playerCountEl.textContent = String(players.size);
+		const survivalScore = isPlaying ? Math.floor((now - scoreStartedAt) / 200) * 10 : 0;
+		const lapBonus =
+			isPlaying && video.duration && Number.isFinite(video.duration)
+				? Math.floor(displayedMediaMs() / (video.duration * 1000)) * 1500
+				: 0;
+		const score = survivalScore + lapBonus;
+		const scoreText = String(Math.max(0, score));
+		if (scoreText !== lastScoreText) {
+			lastScoreText = scoreText;
+			scoreEl.textContent = scoreText;
+		}
+	}
+
 	function render() {
 		const now = performance.now();
 		if (canvasNeedsResize) {
@@ -582,6 +747,7 @@
 		const mediaMs = displayedMediaMs();
 		syncVideo(mediaMs);
 		maybeSendMove(false);
+		updateHud(now);
 
 		const counterText = String(Math.floor(mediaMs / 1000));
 		if (counterText !== lastCounterText) {
@@ -620,7 +786,6 @@
 
 	canvas.addEventListener("pointerdown", (event) => {
 		event.preventDefault();
-		video.play().catch(() => {});
 		const wasStarted = localStarted;
 		activePointerId = event.pointerId;
 		pointerUpdatedDuringActive = false;
@@ -628,8 +793,19 @@
 		if (!wasStarted || event.pointerType !== "mouse") {
 			updatePointer(event, true);
 			pointerUpdatedDuringActive = true;
+			beginPlaying();
 			maybeSendMove(true);
 		}
+	});
+
+	titleScreenEl.addEventListener("pointerdown", (event) => {
+		if (event.target.closest("a")) {
+			return;
+		}
+		event.preventDefault();
+		updatePointer(event, true);
+		beginPlaying();
+		maybeSendMove(true);
 	});
 
 	canvas.addEventListener("pointermove", (event) => {
@@ -660,16 +836,19 @@
 	canvas.addEventListener("pointerup", endPointer);
 	canvas.addEventListener("pointercancel", endPointer);
 	video.addEventListener("loadedmetadata", () => {
-		syncVideo(displayedMediaMs());
+		syncVideo(displayedMediaMs(), true);
 		markCanvasDirty();
 	});
 	video.addEventListener("play", markCanvasDirty);
+	video.addEventListener("seeking", markCanvasDirty);
 	window.addEventListener("resize", () => {
 		canvasNeedsResize = true;
 		markCanvasDirty();
 	});
 
+	updatePortalLink();
 	connect();
 	resizeCanvas();
+	setOverlayVisible(!fromPortal);
 	requestAnimationFrame(render);
 })();

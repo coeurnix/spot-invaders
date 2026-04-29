@@ -25,7 +25,7 @@ const ROOM_CONFIG = {
 	maxSendHz: 10,
 	fullRatePlayerCount: 10,
 	minRatePlayerCount: 100,
-	renderHz: 24,
+	renderHz: 30,
 };
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
@@ -69,7 +69,7 @@ export class MyDurableObject extends DurableObject {
 	private acceptSession(server: WebSocket): void {
 		const isFirstSession = this.sessions.size === 0;
 		if (isFirstSession) {
-			this.roomStartServerMs = Date.now();
+			this.roomStartServerMs = null;
 			this.epoch += 1;
 		}
 
@@ -178,7 +178,14 @@ export class MyDurableObject extends DurableObject {
 			return;
 		}
 
-		if (this.roomStartServerMs !== null) {
+		let roomStarted = false;
+		if (this.roomStartServerMs === null) {
+			if (mediaMs > ROOM_CONFIG.renderDelayMs + 10_000 || mediaMs < -30_000) {
+				return;
+			}
+			this.roomStartServerMs = Date.now() - ROOM_CONFIG.renderDelayMs;
+			roomStarted = true;
+		} else {
 			const expectedMediaMs = Date.now() - this.roomStartServerMs;
 			if (mediaMs > expectedMediaMs + 10_000 || mediaMs < expectedMediaMs - 30_000) {
 				return;
@@ -198,6 +205,15 @@ export class MyDurableObject extends DurableObject {
 		session.lastMediaMs = mediaMs;
 		session.started = true;
 		this.latestByPlayer.set(session.playerId, playerSnapshot(session));
+
+		if (roomStarted) {
+			this.broadcast({
+				type: "room_started",
+				roomStartServerMs: this.roomStartServerMs,
+				serverNowMs: Date.now(),
+				epoch: this.epoch,
+			});
+		}
 
 		this.broadcast({
 			type: "move",
