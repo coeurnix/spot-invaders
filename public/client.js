@@ -2,23 +2,16 @@
 	const params = new URLSearchParams(location.search);
 	const roomId = params.get("room") || "default";
 	const video = document.getElementById("media");
+	const videoFrameCanvas = document.getElementById("video-frame");
+	const videoFrameCtx = videoFrameCanvas.getContext("2d", { alpha: false });
 	const hitOverlayEl = document.getElementById("hit-overlay");
 	const canvas = document.getElementById("stage");
 	const ctx = canvas.getContext("2d", { alpha: true });
-	const counterEl = document.getElementById("counter");
 	const scoreEl = document.getElementById("score");
 	const playerCountEl = document.getElementById("player-count");
 	const titleScreenEl = document.getElementById("title-screen");
 	const gameOverLabelEl = document.getElementById("game-over-label");
 	const portalLinkEl = document.getElementById("portal-link");
-	const debugRoomEl = document.getElementById("debug-room");
-	const debugPlayersEl = document.getElementById("debug-players");
-	const debugPlayerEl = document.getElementById("debug-player");
-	const debugStatusEl = document.getElementById("debug-status");
-	const debugOffsetEl = document.getElementById("debug-offset");
-	const debugRttEl = document.getElementById("debug-rtt");
-	const debugSendHzEl = document.getElementById("debug-sendhz");
-	const debugMediaEl = document.getElementById("debug-media");
 
 	const defaultConfig = {
 		renderDelayMs: 300,
@@ -34,12 +27,29 @@
 		energyRechargeMs: 5000,
 		energyBlastImmunityMs: 5000,
 		energyBlastRadiusPlayerScale: 10,
+		collisionDepthRangeThreshold: 4,
+		collisionSpotRadiusScale: 1,
 	};
 
-	const videoAspect = 1280 / 720;
+	const videoAspect = 16 / 9;
+	const FRAME_SOURCE_HEIGHT = 1080;
+	const COLOR_SOURCE_WIDTH = 1440;
+	const DEPTH_SOURCE_X = 1440;
+	const DEPTH_WIDTH = 480;
+	const DEPTH_HEIGHT = 1080;
+	const DEPTH_FRAME_RATE = 60;
 	const portalRef = params.get("ref") || "";
 	const fromPortal = params.get("portal") === "true";
 	const portalSpawn = { x: 0.12, y: 0.5 };
+	const videoSources = {
+		av1: "https://media.coeurnix.party/spot-invaders-av1.mp4",
+		hq: "https://media.coeurnix.party/spot-invaders-hq.mp4?rev=4",
+		lq: "https://media.coeurnix.party/spot-invaders-lq.mp4",
+	};
+	const av1Supported = ["video/mp4; codecs=\"av01.0.08M.08\"", "video/mp4; codecs=\"av01\"", "video/mp4; codecs=\"av01.0.05M.08\""].some(
+		(type) => video.canPlayType(type),
+	);
+	const preferredVideoQuality = av1Supported ? "av1" : "hq";
 
 	let ws = null;
 	let socketStatus = "idle";
@@ -60,6 +70,7 @@
 	let localStarted = false;
 	let isPlaying = false;
 	let isGameOver = false;
+	let collisionArmedAt = 0;
 	let scoreStartedAt = 0;
 	let lastScoreText = "";
 	let pendingStartPoint = null;
@@ -73,9 +84,18 @@
 	let hitEffectStartedAt = 0;
 	let hitEffectUntil = 0;
 	let hitEffectSeed = 0;
-	let lastCounterText = "";
-	let lastDebugUpdateAt = 0;
 	let lastVideoSyncAt = 0;
+	let videoDurationSeconds = 0;
+	let currentVideoQuality = preferredVideoQuality;
+	let isSwitchingVideoSource = false;
+	let pendingVideoSwitchTime = null;
+	let lqSwitchCount = 0;
+	let lockToLq = false;
+	let qualitySwitchCooldownUntil = 0;
+	let lastRenderFrameAt = 0;
+	let smoothedFps = 60;
+	let lowFpsSince = 0;
+	let highFpsSince = 0;
 	let nextCanvasDrawAt = 0;
 	let canvasNeedsResize = true;
 	let canvasDirty = true;
@@ -89,19 +109,39 @@
 		width: 1,
 		height: 1,
 	};
+	let lastDepthFrameIndex = -1;
+	let depthImageData = null;
+	let depthReadBlocked = false;
+	let videoFrameDrawn = false;
 
 	const players = new Map();
 	const sampleBuffers = new Map();
 	const activeBlasts = [];
 	const seenBlastIds = new Set();
+	const activeExplosions = [];
+	const seenCollisionIds = new Set();
 	const localPreview = {
 		x: 0.5,
 		y: 0.5,
 		vx: 0,
 		vy: 0,
 	};
+	const depthCanvas = document.createElement("canvas");
+	depthCanvas.width = DEPTH_WIDTH;
+	depthCanvas.height = DEPTH_HEIGHT;
+	const depthCtx = depthCanvas.getContext("2d", { willReadFrequently: true });
+	const soundEffects = {
+		zapCharging: new Audio("/media/zap-charging.mp3"),
+		zapBlast: new Audio("/media/zap-blast.mp3"),
+		zapHitThem: new Audio("/media/zap-hit-them.mp3"),
+		zapHitUs: new Audio("/media/zap-hit-us.mp3"),
+		peerCrashed: new Audio("/media/peer-crashed.mp3"),
+		playerCrashed: new Audio("/media/player-crashed.mp3"),
+		peerJoined: new Audio("/media/peer-joins.mp3"),
+		playerJoined: new Audio("/media/player-joins.mp3"),
+	};
+	soundEffects.zapCharging.loop = true;
 
-	debugRoomEl.textContent = roomId;
 	gameOverLabelEl.hidden = true;
 
 	function clamp01(value) {
@@ -124,6 +164,18 @@
 		return Math.max(1, config.energyBlastRadiusPlayerScale || defaultConfig.energyBlastRadiusPlayerScale);
 	}
 
+	function collisionDepthRangeThreshold() {
+		return Math.max(1, config.collisionDepthRangeThreshold || defaultConfig.collisionDepthRangeThreshold);
+	}
+
+	function collisionSpotRadiusScale() {
+		return Math.max(0.1, config.collisionSpotRadiusScale || defaultConfig.collisionSpotRadiusScale);
+	}
+
+	function deferCollisionForStart() {
+		collisionArmedAt = roomStartServerMs === null ? Infinity : performance.now() + 180;
+	}
+
 	function videoUnitPx() {
 		return Math.max(1, Math.min(videoRect.width, videoRect.height));
 	}
@@ -132,8 +184,42 @@
 		return Math.max(5, videoUnitPx() * 0.0195);
 	}
 
+	function collisionRadiusPx() {
+		return playerRadiusPx() * collisionSpotRadiusScale();
+	}
+
 	function blastRadiusPx() {
 		return playerRadiusPx() * energyBlastRadiusScale();
+	}
+
+	function playSound(audio) {
+		if (!audio) {
+			return;
+		}
+		try {
+			audio.pause();
+			audio.currentTime = 0;
+			audio.play().catch(() => {});
+		} catch {
+			// Browser audio state can change during navigation or autoplay gating.
+		}
+	}
+
+	function updateChargingSound() {
+		const shouldPlay = isPlaying && [...players.values()].some((player) => Number.isFinite(player.energyChargeStartedServerMs));
+		const audio = soundEffects.zapCharging;
+		if (shouldPlay && audio.paused) {
+			audio.play().catch(() => {});
+		} else if (!shouldPlay && !audio.paused) {
+			audio.pause();
+			audio.currentTime = 0;
+		}
+	}
+
+	function stopChargingSound() {
+		const audio = soundEffects.zapCharging;
+		audio.pause();
+		audio.currentTime = 0;
 	}
 
 	function syncVideoCssVars() {
@@ -190,16 +276,25 @@
 	}
 
 	function beginPlaying() {
-		if (!isPlaying) {
+		const wasPlaying = isPlaying;
+		if (!wasPlaying) {
 			scoreStartedAt = performance.now();
 			lastScoreText = "";
 		}
 		isPlaying = true;
 		isGameOver = false;
+		document.documentElement.style.setProperty("--hit-overlay-color", "#000000");
 		setOverlayVisible(false);
-		if (roomStartServerMs !== null) {
-			video.play().catch(() => {});
+		if (!wasPlaying) {
+			playSound(soundEffects.playerJoined);
 		}
+		video.play().catch(() => {});
+	}
+
+	function resetScore() {
+		scoreStartedAt = performance.now();
+		lastScoreText = "0";
+		scoreEl.textContent = "0";
 	}
 
 	function pointToVideoSpace(clientX, clientY) {
@@ -216,6 +311,132 @@
 		};
 	}
 
+	function depthPixelToNormalized(x, y) {
+		return {
+			x: clamp01((x + 0.5) / DEPTH_WIDTH),
+			y: clamp01((y + 0.5) / DEPTH_HEIGHT),
+		};
+	}
+
+	function refreshDepthBuffer() {
+		if (depthReadBlocked || !depthCtx || video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+			return false;
+		}
+
+		const frameIndex = Math.floor(video.currentTime * DEPTH_FRAME_RATE);
+		if (depthImageData && frameIndex === lastDepthFrameIndex) {
+			return true;
+		}
+
+		try {
+			depthCtx.drawImage(
+				video,
+				DEPTH_SOURCE_X,
+				0,
+				DEPTH_WIDTH,
+				DEPTH_HEIGHT,
+				0,
+				0,
+				DEPTH_WIDTH,
+				DEPTH_HEIGHT,
+			);
+			depthImageData = depthCtx.getImageData(0, 0, DEPTH_WIDTH, DEPTH_HEIGHT);
+			lastDepthFrameIndex = frameIndex;
+			return true;
+		} catch (error) {
+			depthReadBlocked = true;
+			console.warn("Depth collision sampling is unavailable. Check CORS headers for the video asset.", error);
+			return false;
+		}
+	}
+
+	function depthAt(x, y) {
+		return depthImageData.data[(y * DEPTH_WIDTH + x) * 4];
+	}
+
+	function pointSegmentDistanceSquared(px, py, ax, ay, bx, by) {
+		const dx = bx - ax;
+		const dy = by - ay;
+		const lengthSquared = dx * dx + dy * dy;
+		if (lengthSquared <= 0.000001) {
+			const cx = px - ax;
+			const cy = py - ay;
+			return cx * cx + cy * cy;
+		}
+
+		const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSquared));
+		const closestX = ax + dx * t;
+		const closestY = ay + dy * t;
+		const cx = px - closestX;
+		const cy = py - closestY;
+		return cx * cx + cy * cy;
+	}
+
+	function detectDepthCollision(from, to) {
+		if (!refreshDepthBuffer()) {
+			return null;
+		}
+
+		const radius = collisionRadiusPx();
+		const radiusSquared = radius * radius;
+		const start = {
+			x: clamp01(from.x),
+			y: clamp01(from.y),
+		};
+		const end = {
+			x: clamp01(to.x),
+			y: clamp01(to.y),
+		};
+		const minX = Math.max(
+			0,
+			Math.floor((Math.min(start.x, end.x) - radius / Math.max(1, videoRect.width)) * DEPTH_WIDTH),
+		);
+		const maxX = Math.min(
+			DEPTH_WIDTH - 1,
+			Math.ceil((Math.max(start.x, end.x) + radius / Math.max(1, videoRect.width)) * DEPTH_WIDTH),
+		);
+		const minY = Math.max(
+			0,
+			Math.floor((Math.min(start.y, end.y) - radius / Math.max(1, videoRect.height)) * DEPTH_HEIGHT),
+		);
+		const maxY = Math.min(
+			DEPTH_HEIGHT - 1,
+			Math.ceil((Math.max(start.y, end.y) + radius / Math.max(1, videoRect.height)) * DEPTH_HEIGHT),
+		);
+		const ax = start.x * videoRect.width;
+		const ay = start.y * videoRect.height;
+		const bx = end.x * videoRect.width;
+		const by = end.y * videoRect.height;
+		let lowestElevation = Infinity;
+		let highestElevation = -Infinity;
+
+		for (let y = minY; y <= maxY; y += 1) {
+			const py = ((y + 0.5) / DEPTH_HEIGHT) * videoRect.height;
+			for (let x = minX; x <= maxX; x += 1) {
+				const px = ((x + 0.5) / DEPTH_WIDTH) * videoRect.width;
+				if (pointSegmentDistanceSquared(px, py, ax, ay, bx, by) > radiusSquared) {
+					continue;
+				}
+
+				const elevation = depthAt(x, y);
+				lowestElevation = Math.min(lowestElevation, elevation);
+				highestElevation = Math.max(highestElevation, elevation);
+				if (highestElevation - lowestElevation > collisionDepthRangeThreshold()) {
+					return {
+						...depthPixelToNormalized(x, y),
+						depthX: x,
+						depthY: y,
+						lowestElevation,
+						highestElevation,
+						elevation,
+					};
+				}
+			}
+		}
+
+		return null;
+	}
+
 	function wsUrl() {
 		const protocol = location.protocol === "https:" ? "wss:" : "ws:";
 		return `${protocol}//${location.host}/api/room/${encodeURIComponent(roomId)}/ws`;
@@ -223,7 +444,6 @@
 
 	function setStatus(nextStatus) {
 		socketStatus = nextStatus;
-		debugStatusEl.textContent = nextStatus;
 	}
 
 	function markCanvasDirty(untilMediaMs = displayedMediaMs()) {
@@ -252,17 +472,24 @@
 		return Math.max(config.maxExtrapolateMs || 250, 1000 / currentSendHz() + 120);
 	}
 
+	function activeVideoDuration() {
+		if (video.duration && Number.isFinite(video.duration)) {
+			videoDurationSeconds = video.duration;
+		}
+		return videoDurationSeconds;
+	}
+
 	function mediaClockSeconds(mediaMs) {
-		if (!video.duration || !Number.isFinite(video.duration)) {
+		const duration = activeVideoDuration();
+		if (!duration) {
 			return 0;
 		}
 
-		const duration = video.duration;
 		return ((mediaMs / 1000) % duration + duration) % duration;
 	}
 
 	function videoDriftSeconds(targetSeconds) {
-		const duration = video.duration;
+		const duration = activeVideoDuration();
 		let drift = targetSeconds - video.currentTime;
 		if (duration && Number.isFinite(duration)) {
 			if (drift > duration / 2) {
@@ -275,19 +502,25 @@
 	}
 
 	function syncVideo(mediaMs, force = false) {
+		if (isSwitchingVideoSource) {
+			return;
+		}
+
 		if (roomStartServerMs === null) {
 			video.playbackRate = 1;
-			if (!video.paused) {
-				video.pause();
-			}
-			if (video.duration && Number.isFinite(video.duration) && !video.seeking && video.currentTime !== 0) {
-				video.currentTime = 0;
+			if (!isPlaying) {
+				if (!video.paused) {
+					video.pause();
+				}
+				if (activeVideoDuration() && !video.seeking && Math.abs(video.currentTime) > 0.001) {
+					video.currentTime = 0;
+				}
 			}
 			return;
 		}
 
 		const now = performance.now();
-		if (!video.duration || !Number.isFinite(video.duration)) {
+		if (!activeVideoDuration()) {
 			return;
 		}
 		if (!force && now - lastVideoSyncAt < 100) {
@@ -305,6 +538,120 @@
 			video.play().catch(() => {
 				// Muted autoplay is normally allowed; if blocked, the next user gesture retries.
 			});
+		}
+	}
+
+	function resetAdaptiveQualityTimers(now = performance.now()) {
+		lowFpsSince = 0;
+		highFpsSince = 0;
+		qualitySwitchCooldownUntil = now + 2500;
+	}
+
+	function switchVideoQuality(nextQuality) {
+		if (isSwitchingVideoSource || currentVideoQuality === nextQuality || !videoSources[nextQuality]) {
+			return;
+		}
+		if (preferredVideoQuality === "av1") {
+			return;
+		}
+		if (nextQuality === "hq" && lockToLq) {
+			return;
+		}
+
+		const now = performance.now();
+		const targetSeconds = roomStartServerMs === null ? video.currentTime || 0 : mediaClockSeconds(displayedMediaMs());
+		if (nextQuality === "lq") {
+			lqSwitchCount += 1;
+			lockToLq = lqSwitchCount >= 2;
+		}
+
+		currentVideoQuality = nextQuality;
+		isSwitchingVideoSource = true;
+		pendingVideoSwitchTime = targetSeconds;
+		lastVideoSyncAt = 0;
+		lastDepthFrameIndex = -1;
+		depthImageData = null;
+		resetAdaptiveQualityTimers(now);
+		video.src = videoSources[nextQuality];
+		video.load();
+	}
+
+	function finishVideoQualitySwitch() {
+		if (!isSwitchingVideoSource) {
+			return;
+		}
+
+		const duration = activeVideoDuration();
+		let targetSeconds = pendingVideoSwitchTime || 0;
+		if (roomStartServerMs !== null && duration) {
+			targetSeconds = mediaClockSeconds(displayedMediaMs());
+		}
+		if (duration) {
+			targetSeconds = ((targetSeconds % duration) + duration) % duration;
+		}
+
+		if (!video.seeking && duration && Math.abs(video.currentTime - targetSeconds) > 0.04) {
+			video.currentTime = targetSeconds;
+			return;
+		}
+
+		isSwitchingVideoSource = false;
+		pendingVideoSwitchTime = null;
+		lastVideoSyncAt = 0;
+		markCanvasDirty(displayedMediaMs() + 500);
+		if (isPlaying) {
+			video.play().catch(() => {});
+		}
+	}
+
+	function updateAdaptiveVideoQuality(now) {
+		if (lastRenderFrameAt > 0) {
+			const frameMs = now - lastRenderFrameAt;
+			if (frameMs > 0 && frameMs < 1000) {
+				const fps = 1000 / frameMs;
+				smoothedFps = smoothedFps * 0.9 + fps * 0.1;
+			}
+		}
+		lastRenderFrameAt = now;
+
+		if (
+			!isPlaying ||
+			roomStartServerMs === null ||
+			document.hidden ||
+			isSwitchingVideoSource ||
+			now < qualitySwitchCooldownUntil
+		) {
+			return;
+		}
+		if (preferredVideoQuality === "av1") {
+			return;
+		}
+
+		if (currentVideoQuality === "hq") {
+			highFpsSince = 0;
+			if (smoothedFps < 20) {
+				lowFpsSince ||= now;
+				if (now - lowFpsSince >= 3000) {
+					switchVideoQuality("lq");
+				}
+			} else {
+				lowFpsSince = 0;
+			}
+			return;
+		}
+
+		if (lockToLq) {
+			return;
+		}
+
+		lowFpsSince = 0;
+		if (smoothedFps > 30) {
+			highFpsSince ||= now;
+			if (now - highFpsSince >= 8000) {
+				switchVideoQuality("hq");
+			}
+		} else {
+			highFpsSince = 0;
 		}
 	}
 
@@ -376,12 +723,16 @@
 			handleWelcome(message);
 		} else if (message.type === "player_joined") {
 			upsertPlayer(message.player);
+			if (isPlaying && message.player?.playerId && message.player.playerId !== playerId) {
+				playSound(soundEffects.peerJoined);
+			}
 			if (message.player?.started) {
 				markCanvasDirty();
 			}
 		} else if (message.type === "player_left") {
 			players.delete(message.playerId);
 			sampleBuffers.delete(message.playerId);
+			updateChargingSound();
 			markCanvasDirty();
 		} else if (message.type === "room_started") {
 			handleRoomStarted(message);
@@ -395,6 +746,8 @@
 			handleEnergyBlast(message);
 		} else if (message.type === "energy_state") {
 			handleEnergyState(message);
+		} else if (message.type === "collision") {
+			handleCollision(message);
 		} else if (message.type === "pong") {
 			handlePong(message);
 		}
@@ -418,6 +771,9 @@
 		sampleBuffers.clear();
 		activeBlasts.length = 0;
 		seenBlastIds.clear();
+		activeExplosions.length = 0;
+		seenCollisionIds.clear();
+		stopChargingSound();
 		localEnergyRechargeUntilServerMs = 0;
 		localBlastImmuneUntilServerMs = 0;
 		mustReleaseBeforeCharge = false;
@@ -452,12 +808,14 @@
 		if (pendingStartPoint) {
 			startAtNormalizedPoint(pendingStartPoint, true);
 			pendingStartPoint = null;
+			deferCollisionForStart();
 			beginPlaying();
 			maybeSendMove(true);
 			return;
 		}
 		if (fromPortal && !localStarted) {
 			startAtNormalizedPoint(portalSpawn, true);
+			deferCollisionForStart();
 			beginPlaying();
 			maybeSendMove(true);
 		}
@@ -477,6 +835,7 @@
 			clockOffsetMs = clockOffsetMs * 0.8 + sampleOffset * 0.2;
 		}
 		syncVideo(displayedMediaMs(), true);
+		collisionArmedAt = performance.now() + 180;
 		markCanvasDirty(displayedMediaMs() + currentMaxExtrapolateMs());
 	}
 
@@ -641,6 +1000,7 @@
 		if (player.playerId === playerId) {
 			localEnergyRechargeUntilServerMs = player.energyRechargeUntilServerMs;
 		}
+		updateChargingSound();
 		markCanvasDirty(displayedMediaMs() + energyChargeMs() + 500);
 	}
 
@@ -654,6 +1014,7 @@
 		if (player.playerId === playerId) {
 			energyPointerId = null;
 		}
+		updateChargingSound();
 		markCanvasDirty();
 	}
 
@@ -672,7 +1033,170 @@
 		if (player.playerId === playerId) {
 			localEnergyRechargeUntilServerMs = player.energyRechargeUntilServerMs;
 		}
+		updateChargingSound();
 		markCanvasDirty();
+	}
+
+	function addExplosion(explosion) {
+		if (!explosion.id || seenCollisionIds.has(explosion.id)) {
+			return;
+		}
+		seenCollisionIds.add(explosion.id);
+		if (seenCollisionIds.size > 100) {
+			seenCollisionIds.delete(seenCollisionIds.values().next().value);
+		}
+
+		activeExplosions.push(explosion);
+		if (activeExplosions.length > 32) {
+			activeExplosions.splice(0, activeExplosions.length - 32);
+		}
+		markCanvasDirty(displayedMediaMs() + 1400);
+	}
+
+	function showLocalGameOver() {
+		isPlaying = false;
+		isGameOver = true;
+		collisionArmedAt = 0;
+		localStarted = false;
+		localDirty = false;
+		resetScore();
+		stopChargingSound();
+		if (activePointerId !== null) {
+			try {
+				canvas.releasePointerCapture?.(activePointerId);
+			} catch {
+				// Pointer capture may already have been released by the browser.
+			}
+		}
+		activePointerId = null;
+		pointerUpdatedDuringActive = false;
+		energyPointerId = null;
+		mustReleaseBeforeCharge = false;
+		localPreview.vx = 0;
+		localPreview.vy = 0;
+		lastPointerSample = null;
+		hitEffectStartedAt = performance.now();
+		hitEffectUntil = hitEffectStartedAt + 1150;
+		hitEffectSeed = Math.random() * 1000;
+		document.documentElement.style.setProperty("--hit-overlay-color", "#ff143d");
+		setOverlayVisible(true);
+		updatePortalLink();
+		markCanvasDirty(displayedMediaMs() + 1400);
+	}
+
+	function handleLocalCollision(collision) {
+		if (!localStarted || !playerId) {
+			return;
+		}
+
+		seq += 1;
+		const collisionId = `${playerId}:${seq}:collision`;
+		const mediaMs = displayedMediaMs() + config.inputLeadMs;
+		const x = clamp01(collision.x);
+		const y = clamp01(collision.y);
+		localPreview.x = x;
+		localPreview.y = y;
+
+		const local = players.get(playerId);
+		if (local) {
+			local.x = x;
+			local.y = y;
+			local.vx = 0;
+			local.vy = 0;
+			local.started = false;
+			local.lastSeq = seq;
+			local.lastMediaMs = mediaMs;
+			local.energyChargeStartedServerMs = null;
+		}
+		sampleBuffers.delete(playerId);
+		addExplosion({
+			id: collisionId,
+			playerId,
+			x,
+			y,
+			color: localColor,
+			collisionServerMs: estimatedServerNowMs(),
+		});
+		playSound(soundEffects.playerCrashed);
+		showLocalGameOver();
+
+		if (ws?.readyState === WebSocket.OPEN) {
+			ws.send(
+				JSON.stringify({
+					type: "collision",
+					collisionId,
+					seq,
+					mediaMs,
+					x,
+					y,
+					lowestElevation: collision.lowestElevation,
+					highestElevation: collision.highestElevation,
+					elevation: collision.elevation,
+				}),
+			);
+		}
+	}
+
+	function handleCollision(message) {
+		if (
+			!message.playerId ||
+			!message.collisionId ||
+			!Number.isFinite(message.x) ||
+			!Number.isFinite(message.y) ||
+			!Number.isFinite(message.serverNowMs)
+		) {
+			return;
+		}
+
+		const player = players.get(message.playerId) || {
+			playerId: message.playerId,
+			color: message.color || "#ffffff",
+			x: clamp01(message.x),
+			y: clamp01(message.y),
+			vx: 0,
+			vy: 0,
+			lastSeq: Number.isFinite(message.seq) ? message.seq : 0,
+			lastMediaMs: Number.isFinite(message.mediaMs) ? message.mediaMs : 0,
+			started: false,
+			energyChargeStartedServerMs: null,
+			energyRechargeUntilServerMs: 0,
+			energyBlastSeq: 0,
+		};
+
+		player.x = clamp01(message.x);
+		player.y = clamp01(message.y);
+		player.vx = 0;
+		player.vy = 0;
+		player.started = false;
+		player.energyChargeStartedServerMs = null;
+		if (Number.isFinite(message.seq)) {
+			player.lastSeq = Math.max(player.lastSeq || 0, message.seq);
+		}
+		if (Number.isFinite(message.mediaMs)) {
+			player.lastMediaMs = message.mediaMs;
+		}
+		if (message.color) {
+			player.color = message.color;
+		}
+		players.set(player.playerId, player);
+		sampleBuffers.delete(player.playerId);
+
+		addExplosion({
+			id: message.collisionId,
+			playerId: player.playerId,
+			x: player.x,
+			y: player.y,
+			color: player.color,
+			collisionServerMs: message.serverNowMs,
+		});
+
+		if (player.playerId === playerId && localStarted) {
+			playSound(soundEffects.playerCrashed);
+			showLocalGameOver();
+		} else if (player.playerId !== playerId) {
+			playSound(soundEffects.peerCrashed);
+			updateChargingSound();
+		}
 	}
 
 	function handleEnergyBlast(message) {
@@ -715,10 +1239,30 @@
 			activeBlasts.splice(0, activeBlasts.length - 32);
 		}
 
+		playSound(soundEffects.zapBlast);
+		updateChargingSound();
+		maybePlayPeerBlastHit(message);
 		if (player.playerId !== playerId) {
 			maybeApplyBlastHit(message);
 		}
 		markCanvasDirty(displayedMediaMs() + 1500);
+	}
+
+	function maybePlayPeerBlastHit(blast) {
+		const mediaMs = displayedMediaMs();
+		for (const [id, player] of players) {
+			if (id === playerId || id === blast.playerId || !player.started) {
+				continue;
+			}
+
+			const position = reconstruct(id, mediaMs);
+			const dx = (position.x - clamp01(blast.x)) * videoRect.width;
+			const dy = (position.y - clamp01(blast.y)) * videoRect.height;
+			if (Math.hypot(dx, dy) <= blastRadiusPx()) {
+				playSound(soundEffects.zapHitThem);
+				return;
+			}
+		}
 	}
 
 	function maybeApplyBlastHit(blast) {
@@ -736,6 +1280,7 @@
 		hitEffectStartedAt = performance.now();
 		hitEffectUntil = hitEffectStartedAt + 3000;
 		hitEffectSeed = Math.random() * 1000;
+		playSound(soundEffects.zapHitUs);
 	}
 
 	function pushSample(id, sample) {
@@ -835,13 +1380,35 @@
 		return { x: player.x, y: player.y, stale: true };
 	}
 
-	function updatePointer(event, resetVelocity) {
+	function updatePointer(event, resetVelocity, checkCollision = false) {
 		const point = pointToVideoSpace(event.clientX, event.clientY);
 		if (!playerId) {
 			pendingStartPoint = point;
-			return;
+			return true;
+		}
+		if (checkCollision && localStarted && performance.now() >= collisionArmedAt) {
+			const collision = detectDepthCollision(localPreview, point);
+			if (collision) {
+				handleLocalCollision(collision);
+				return false;
+			}
 		}
 		startAtNormalizedPoint(point, resetVelocity);
+		return true;
+	}
+
+	function maybeCheckLocalDepthCollision() {
+		if (!isPlaying || !localStarted || !playerId || performance.now() < collisionArmedAt) {
+			return false;
+		}
+
+		const collision = detectDepthCollision(localPreview, localPreview);
+		if (!collision) {
+			return false;
+		}
+
+		handleLocalCollision(collision);
+		return true;
 	}
 
 	function maybeSendMove(force = false) {
@@ -941,12 +1508,17 @@
 			videoHeight = videoWidth / videoAspect;
 		}
 
-		if (canvas.width !== Math.round(nextWidth * nextDpr) || canvas.height !== Math.round(nextHeight * nextDpr)) {
+		const didResize =
+			canvas.width !== Math.round(nextWidth * nextDpr) || canvas.height !== Math.round(nextHeight * nextDpr);
+		if (didResize) {
 			dpr = nextDpr;
 			viewWidth = nextWidth;
 			viewHeight = nextHeight;
 			canvas.width = Math.round(viewWidth * dpr);
 			canvas.height = Math.round(viewHeight * dpr);
+			videoFrameCanvas.width = Math.round(viewWidth * dpr);
+			videoFrameCanvas.height = Math.round(viewHeight * dpr);
+			videoFrameDrawn = false;
 		}
 		videoRect = {
 			x: (nextWidth - videoWidth) / 2,
@@ -957,8 +1529,40 @@
 		syncVideoCssVars();
 
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		videoFrameCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		if (didResize) {
+			videoFrameCtx.fillStyle = "#000000";
+			videoFrameCtx.fillRect(0, 0, viewWidth, viewHeight);
+		}
 		canvasNeedsResize = false;
 		markCanvasDirty();
+	}
+
+	function drawVideoFrame() {
+		if (video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+			return;
+		}
+
+		try {
+			if (!videoFrameDrawn) {
+				videoFrameCtx.fillStyle = "#000000";
+				videoFrameCtx.fillRect(0, 0, viewWidth, viewHeight);
+			}
+			videoFrameCtx.drawImage(
+				video,
+				0,
+				0,
+				COLOR_SOURCE_WIDTH,
+				FRAME_SOURCE_HEIGHT,
+				videoRect.x,
+				videoRect.y,
+				videoRect.width,
+				videoRect.height,
+			);
+			videoFrameDrawn = true;
+		} catch {
+			// Keep the last complete frame visible until the media element is drawable again.
+		}
 	}
 
 	function drawChargeOutline(position, player, serverNowMs) {
@@ -995,19 +1599,29 @@
 		const y = point.y;
 		const radius = playerRadiusPx();
 		const color = player.color;
+		const ringHue = (serverNowMs / 14 + (player.playerId?.charCodeAt(0) || 0) * 23) % 360;
 
 		drawChargeOutline(position, player, serverNowMs);
-		ctx.globalAlpha = position.stale ? 0.72 : 1;
-		ctx.lineWidth = Math.max(1.5, radius * (isLocal ? 0.14 : 0.26));
-		ctx.strokeStyle = isLocal ? "rgba(255, 255, 255, 0.9)" : color;
-		ctx.fillStyle = isLocal ? color : "rgba(255, 255, 255, 0.02)";
+		ctx.save();
+		ctx.globalAlpha = (position.stale ? 0.72 : 1) * (isLocal ? 1 : 0.75);
+		ctx.fillStyle = color;
 		ctx.beginPath();
 		ctx.arc(x, y, radius, 0, Math.PI * 2);
-		if (isLocal) {
-			ctx.fill();
-		}
+		ctx.fill();
+
+		ctx.lineWidth = Math.max(2, radius * 0.18);
+		ctx.strokeStyle = `hsl(${ringHue}, 100%, 68%)`;
+		ctx.shadowColor = ctx.strokeStyle;
+		ctx.shadowBlur = radius * 1.35;
+		ctx.beginPath();
+		ctx.arc(x, y, radius, 0, Math.PI * 2);
 		ctx.stroke();
-		ctx.globalAlpha = 1;
+		ctx.fillStyle = isLocal ? "rgba(255, 255, 255, 0.92)" : "rgba(0, 0, 0, 0.72)";
+		ctx.shadowBlur = 0;
+		ctx.beginPath();
+		ctx.arc(x, y, radius * 0.38, 0, Math.PI * 2);
+		ctx.fill();
+		ctx.restore();
 	}
 
 	function drawBlast(blast, serverNowMs) {
@@ -1041,6 +1655,42 @@
 		return true;
 	}
 
+	function drawExplosion(explosion, serverNowMs) {
+		const elapsedMs = serverNowMs - explosion.collisionServerMs;
+		const durationMs = 1050;
+		if (elapsedMs < -100 || elapsedMs > durationMs) {
+			return false;
+		}
+
+		const progress = clamp01(elapsedMs / durationMs);
+		const point = normalizedToCanvas(explosion);
+		const radius = playerRadiusPx();
+		const alpha = (1 - progress) ** 0.75;
+		const sparks = 14;
+
+		ctx.save();
+		ctx.globalAlpha = alpha;
+		ctx.lineWidth = Math.max(2, radius * (0.34 - progress * 0.14));
+		ctx.strokeStyle = "#ff3158";
+		ctx.shadowColor = "#ff3158";
+		ctx.shadowBlur = radius * (2.4 - progress);
+		ctx.beginPath();
+		ctx.arc(point.x, point.y, radius * (1 + progress * 5.4), 0, Math.PI * 2);
+		ctx.stroke();
+
+		ctx.fillStyle = explosion.color || "#ffffff";
+		for (let index = 0; index < sparks; index += 1) {
+			const angle = (index / sparks) * Math.PI * 2 + progress * 0.7;
+			const distance = radius * (0.8 + progress * (2.8 + (index % 4) * 0.55));
+			const sparkRadius = Math.max(1.5, radius * (0.22 - progress * 0.1));
+			ctx.beginPath();
+			ctx.arc(point.x + Math.cos(angle) * distance, point.y + Math.sin(angle) * distance, sparkRadius, 0, Math.PI * 2);
+			ctx.fill();
+		}
+		ctx.restore();
+		return true;
+	}
+
 	function hasActiveEnergyEffects(serverNowMs) {
 		for (const player of players.values()) {
 			if (
@@ -1051,14 +1701,17 @@
 			}
 		}
 
-		return activeBlasts.some((blast) => serverNowMs - blast.blastServerMs <= 950);
+		return (
+			activeBlasts.some((blast) => serverNowMs - blast.blastServerMs <= 950) ||
+			activeExplosions.some((explosion) => serverNowMs - explosion.collisionServerMs <= 1050)
+		);
 	}
 
 	function updateHitEffect(now) {
 		if (now >= hitEffectUntil) {
-			video.style.setProperty("--shake-x", "0px");
-			video.style.setProperty("--shake-y", "0px");
-			video.style.filter = "";
+			document.documentElement.style.setProperty("--shake-x", "0px");
+			document.documentElement.style.setProperty("--shake-y", "0px");
+			videoFrameCanvas.style.filter = "";
 			hitOverlayEl.style.opacity = "0";
 			return;
 		}
@@ -1071,28 +1724,19 @@
 		const shakeX = Math.sin(phase * 1.7) * amplitude + Math.sin(phase * 0.63) * amplitude * 0.45;
 		const shakeY = Math.cos(phase * 1.3) * amplitude + Math.sin(phase * 0.91) * amplitude * 0.4;
 
-		video.style.setProperty("--shake-x", `${shakeX.toFixed(2)}px`);
-		video.style.setProperty("--shake-y", `${shakeY.toFixed(2)}px`);
-		video.style.filter = `brightness(${Math.max(0.48, 1 - intensity * 0.42).toFixed(3)})`;
+		document.documentElement.style.setProperty("--shake-x", `${shakeX.toFixed(2)}px`);
+		document.documentElement.style.setProperty("--shake-y", `${shakeY.toFixed(2)}px`);
+		videoFrameCanvas.style.filter = `brightness(${Math.max(0.48, 1 - intensity * 0.42).toFixed(3)})`;
 		hitOverlayEl.style.opacity = (intensity * 0.48).toFixed(3);
-	}
-
-	function updateDebug(mediaMs) {
-		debugPlayersEl.textContent = String(players.size);
-		debugPlayerEl.textContent = playerId ? playerId.slice(0, 8) : "-";
-		debugStatusEl.textContent = socketStatus;
-		debugOffsetEl.textContent = `${Math.round(clockOffsetMs)} ms`;
-		debugRttEl.textContent = rttMs === null ? "-" : `${Math.round(rttMs)} ms`;
-		debugSendHzEl.textContent = currentSendHz().toFixed(1);
-		debugMediaEl.textContent = `${(mediaMs / 1000).toFixed(2)} s`;
 	}
 
 	function updateHud(now) {
 		playerCountEl.textContent = String(players.size);
 		const survivalScore = isPlaying ? Math.floor((now - scoreStartedAt) / 200) * 10 : 0;
+		const duration = activeVideoDuration();
 		const lapBonus =
-			isPlaying && video.duration && Number.isFinite(video.duration)
-				? Math.floor(displayedMediaMs() / (video.duration * 1000)) * 1500
+			isPlaying && duration
+				? Math.floor(displayedMediaMs() / (duration * 1000)) * 1500
 				: 0;
 		const score = survivalScore + lapBonus;
 		const scoreText = String(Math.max(0, score));
@@ -1104,27 +1748,21 @@
 
 	function render() {
 		const now = performance.now();
+		updateAdaptiveVideoQuality(now);
 		if (canvasNeedsResize) {
 			resizeCanvas();
 		}
 
 		const mediaMs = displayedMediaMs();
 		syncVideo(mediaMs);
-		maybeSendMove(false);
+		drawVideoFrame();
+		const collided = maybeCheckLocalDepthCollision();
+		if (!collided) {
+			maybeSendMove(false);
+		}
 		updateHud(now);
 		updateHitEffect(now);
 		const serverNowMs = estimatedServerNowMs();
-
-		const counterText = String(Math.floor(mediaMs / 1000));
-		if (counterText !== lastCounterText) {
-			lastCounterText = counterText;
-			counterEl.textContent = counterText;
-		}
-
-		if (now - lastDebugUpdateAt >= 100) {
-			lastDebugUpdateAt = now;
-			updateDebug(mediaMs);
-		}
 
 		const targetRenderHz = Math.max(15, Math.min(60, config.renderHz || 30));
 		const shouldDrawCanvas = canvasDirty || mediaMs <= canvasDirtyUntilMediaMs || hasActiveEnergyEffects(serverNowMs);
@@ -1140,10 +1778,18 @@
 				activeBlasts.splice(index, 1);
 			}
 		}
+		for (let index = activeExplosions.length - 1; index >= 0; index -= 1) {
+			if (serverNowMs - activeExplosions[index].collisionServerMs > 1100) {
+				activeExplosions.splice(index, 1);
+			}
+		}
 		ctx.clearRect(0, 0, viewWidth, viewHeight);
 
 		for (const blast of activeBlasts) {
 			drawBlast(blast, serverNowMs);
+		}
+		for (const explosion of activeExplosions) {
+			drawExplosion(explosion, serverNowMs);
 		}
 
 		for (const [id, player] of players) {
@@ -1172,8 +1818,13 @@
 		pointerUpdatedDuringActive = false;
 		canvas.setPointerCapture?.(event.pointerId);
 		if (!wasStarted || event.pointerType !== "mouse") {
-			updatePointer(event, true);
+			if (!updatePointer(event, true, wasStarted)) {
+				return;
+			}
 			pointerUpdatedDuringActive = true;
+			if (!wasStarted) {
+				deferCollisionForStart();
+			}
 			beginPlaying();
 			maybeSendMove(true);
 		} else {
@@ -1187,6 +1838,7 @@
 		}
 		event.preventDefault();
 		updatePointer(event, true);
+		deferCollisionForStart();
 		beginPlaying();
 		maybeSendMove(true);
 	});
@@ -1197,7 +1849,11 @@
 		}
 		event.preventDefault();
 		const events = typeof event.getCoalescedEvents === "function" ? event.getCoalescedEvents() : [event];
-		updatePointer(events[events.length - 1] || event, false);
+		for (const pointerEvent of events.length ? events : [event]) {
+			if (!updatePointer(pointerEvent, false, true)) {
+				return;
+			}
+		}
 		pointerUpdatedDuringActive = true;
 		maybeSendMove(false);
 	});
@@ -1209,8 +1865,9 @@
 		event.preventDefault();
 		endEnergyCharge(event);
 		if (pointerUpdatedDuringActive || event.pointerType !== "mouse") {
-			updatePointer(event, false);
-			maybeSendMove(true);
+			if (updatePointer(event, false, localStarted)) {
+				maybeSendMove(true);
+			}
 		}
 		activePointerId = null;
 		pointerUpdatedDuringActive = false;
@@ -1220,17 +1877,33 @@
 	canvas.addEventListener("pointerup", endPointer);
 	canvas.addEventListener("pointercancel", endPointer);
 	video.addEventListener("loadedmetadata", () => {
+		activeVideoDuration();
+		finishVideoQualitySwitch();
 		syncVideo(displayedMediaMs(), true);
 		markCanvasDirty();
 	});
-	video.addEventListener("play", markCanvasDirty);
-	video.addEventListener("seeking", markCanvasDirty);
+	video.addEventListener("play", () => markCanvasDirty());
+	video.addEventListener("seeking", () => {
+		lastDepthFrameIndex = -1;
+		markCanvasDirty();
+	});
+	video.addEventListener("seeked", () => {
+		lastDepthFrameIndex = -1;
+		finishVideoQualitySwitch();
+		markCanvasDirty();
+	});
+	video.addEventListener("canplay", () => {
+		finishVideoQualitySwitch();
+		markCanvasDirty();
+	});
 	window.addEventListener("resize", () => {
 		canvasNeedsResize = true;
 		markCanvasDirty();
 	});
 
 	updatePortalLink();
+	video.src = videoSources[currentVideoQuality];
+	video.load();
 	connect();
 	resizeCanvas();
 	setOverlayVisible(!fromPortal);

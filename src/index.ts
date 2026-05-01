@@ -34,6 +34,8 @@ const ROOM_CONFIG = {
 	energyRechargeMs: 5000,
 	energyBlastImmunityMs: 5000,
 	energyBlastRadiusPlayerScale: 10,
+	collisionDepthRangeThreshold: 4,
+	collisionSpotRadiusScale: 1,
 };
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
@@ -164,6 +166,11 @@ export class MyDurableObject extends DurableObject {
 			return;
 		}
 
+		if (data.type === "collision") {
+			this.handleCollision(session, data);
+			return;
+		}
+
 		if (data.type === "energy_start") {
 			this.handleEnergyStart(session);
 			return;
@@ -251,6 +258,61 @@ export class MyDurableObject extends DurableObject {
 			vy,
 			serverNowMs: Date.now(),
 			started: true,
+		});
+	}
+
+	private handleCollision(session: Session, data: Record<string, unknown>): void {
+		if (
+			!isFiniteNumber(data.seq) ||
+			!Number.isInteger(data.seq) ||
+			!isFiniteNumber(data.mediaMs) ||
+			!isFiniteNumber(data.x) ||
+			!isFiniteNumber(data.y)
+		) {
+			return;
+		}
+
+		const seq = data.seq;
+		const mediaMs = data.mediaMs;
+		if (seq <= session.lastSeq || seq < 0 || !session.started) {
+			return;
+		}
+
+		if (this.roomStartServerMs !== null) {
+			const expectedMediaMs = Date.now() - this.roomStartServerMs;
+			if (mediaMs > expectedMediaMs + 10_000 || mediaMs < expectedMediaMs - 30_000) {
+				return;
+			}
+		}
+
+		const now = Date.now();
+		const x = clamp01(data.x);
+		const y = clamp01(data.y);
+
+		this.clearEnergyTimer(session);
+		session.x = x;
+		session.y = y;
+		session.vx = 0;
+		session.vy = 0;
+		session.lastSeq = seq;
+		session.lastMediaMs = mediaMs;
+		session.started = false;
+		session.energyChargeStartedServerMs = null;
+		this.latestByPlayer.set(session.playerId, playerSnapshot(session));
+
+		this.broadcast({
+			type: "collision",
+			playerId: session.playerId,
+			collisionId:
+				typeof data.collisionId === "string" && data.collisionId.length <= 120
+					? data.collisionId
+					: `${session.playerId}:${seq}`,
+			seq,
+			mediaMs,
+			x,
+			y,
+			color: session.color,
+			serverNowMs: now,
 		});
 	}
 

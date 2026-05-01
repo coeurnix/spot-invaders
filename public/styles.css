@@ -8,6 +8,7 @@
 	--ui-gap: clamp(5px, calc(var(--video-unit) * 0.012), 12px);
 	--shake-x: 0px;
 	--shake-y: 0px;
+	--hit-overlay-color: #000000;
 	color-scheme: dark;
 	font-family:
 		Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -41,14 +42,22 @@ body {
 
 #media {
 	position: fixed;
-	left: 50%;
-	top: 50%;
+	left: -1px;
+	top: -1px;
+	width: 1px;
+	height: 1px;
+	opacity: 0;
+	pointer-events: none;
+}
+
+#video-frame {
+	position: fixed;
+	inset: 0;
 	z-index: 0;
 	width: 100vw;
 	height: 100vh;
-	transform: translate(calc(-50% + var(--shake-x)), calc(-50% + var(--shake-y)));
+	transform: translate(var(--shake-x), var(--shake-y));
 	background: #000000;
-	object-fit: contain;
 	pointer-events: none;
 }
 
@@ -59,7 +68,7 @@ body {
 	z-index: 1;
 	width: var(--video-width);
 	height: var(--video-height);
-	background: #000000;
+	background: var(--hit-overlay-color);
 	opacity: 0;
 	pointer-events: none;
 	transition: opacity 80ms linear;
@@ -69,42 +78,36 @@ body {
 	z-index: 2;
 }
 
-#counter {
-	position: fixed;
-	left: 50%;
-	top: 50%;
-	z-index: 2;
-	transform: translate(-50%, -50%);
-	min-width: 6ch;
-	pointer-events: none;
-	text-align: center;
-	font-size: clamp(48px, calc(var(--video-unit) * 0.24), 180px);
-	font-weight: 800;
-	line-height: 1;
-	color: rgba(255, 255, 255, 0.28);
-	text-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-	font-variant-numeric: tabular-nums;
-}
-
 #hud {
 	position: fixed;
-	left: calc(var(--video-left) + var(--video-width) - min(calc(var(--video-width) * 0.25), 260px) - var(--ui-pad));
-	top: calc(var(--video-top) + var(--ui-pad));
+	inset: 0;
 	z-index: 3;
-	display: flex;
-	gap: var(--ui-gap);
-	align-items: stretch;
 	pointer-events: none;
 	font-variant-numeric: tabular-nums;
 }
 
 #hud div {
+	position: fixed;
+	top: calc(var(--video-top) + var(--ui-pad));
 	min-width: min(calc(var(--video-width) * 0.115), 124px);
 	padding: calc(var(--ui-pad) * 0.72) calc(var(--ui-pad) * 0.88);
 	border: 1px solid rgba(255, 255, 255, 0.14);
 	border-radius: 8px;
 	background: rgba(9, 10, 15, 0.72);
 	box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+}
+
+#hud .hud-score {
+	right: calc(100vw - var(--video-left) - var(--video-width) + var(--ui-pad));
+	text-align: right;
+}
+
+#hud .hud-players {
+	left: calc(var(--video-left) + var(--ui-pad));
+	min-width: auto;
+	border-color: transparent;
+	background: transparent;
+	box-shadow: none;
 }
 
 #hud span {
@@ -122,6 +125,10 @@ body {
 	color: #ffffff;
 	font-size: clamp(16px, calc(var(--video-unit) * 0.034), 28px);
 	line-height: 1;
+}
+
+#hud .hud-score strong {
+	text-align: right;
 }
 
 #title-screen {
@@ -192,6 +199,10 @@ h1 {
 	text-shadow: 0 4px 18px rgba(0, 0, 0, 0.85);
 }
 
+.instructions span {
+	display: block;
+}
+
 .credit-link,
 .portal-link {
 	color: rgba(246, 249, 255, 0.76);
@@ -233,50 +244,7 @@ h1 {
 	font-size: clamp(10px, calc(var(--video-unit) * 0.016), 12px);
 }
 
-#debug {
-	position: fixed;
-	left: calc(var(--video-left) + var(--ui-pad));
-	top: calc(var(--video-top) + var(--ui-pad));
-	z-index: 3;
-	width: min(calc(var(--video-width) * 0.24), 280px);
-	padding: calc(var(--ui-pad) * 0.86);
-	border: 1px solid rgba(255, 255, 255, 0.12);
-	border-radius: 8px;
-	background: rgba(9, 10, 15, 0.9);
-	box-shadow: 0 20px 60px rgba(0, 0, 0, 0.32);
-	font-size: clamp(9px, calc(var(--video-unit) * 0.016), 12px);
-	line-height: 1.45;
-}
-
-#debug div {
-	display: grid;
-	grid-template-columns: minmax(56px, calc(var(--video-width) * 0.075)) minmax(0, 1fr);
-	gap: calc(var(--ui-gap) * 0.9);
-	align-items: baseline;
-}
-
-#debug span {
-	color: rgba(225, 230, 244, 0.62);
-}
-
-#debug strong {
-	min-width: 0;
-	overflow: hidden;
-	color: #ffffff;
-	font-weight: 650;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-	font-variant-numeric: tabular-nums;
-}
-
 @media (max-width: 560px) {
-	#hud {
-		left: auto;
-		right: calc(100vw - var(--video-left) - var(--video-width) + var(--ui-pad));
-		top: calc(var(--video-top) + var(--ui-pad));
-		gap: calc(var(--ui-gap) * 0.75);
-	}
-
 	#hud div {
 		min-width: min(calc(var(--video-width) * 0.16), 92px);
 		padding: calc(var(--ui-pad) * 0.72);
@@ -294,16 +262,4 @@ h1 {
 		margin-top: calc(var(--ui-pad) * 1.1);
 	}
 
-	#debug {
-		left: calc(var(--video-left) + var(--ui-pad));
-		top: auto;
-		bottom: calc(100vh - var(--video-top) - var(--video-height) + var(--ui-pad));
-		width: min(calc(var(--video-width) * 0.54), 260px);
-		padding: calc(var(--ui-pad) * 0.72);
-		font-size: clamp(8px, calc(var(--video-unit) * 0.018), 11px);
-	}
-
-	#debug div {
-		grid-template-columns: minmax(48px, calc(var(--video-width) * 0.14)) minmax(0, 1fr);
-	}
 }
