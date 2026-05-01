@@ -4,6 +4,8 @@
 	const video = document.getElementById("media");
 	const videoFrameCanvas = document.getElementById("video-frame");
 	const videoFrameCtx = videoFrameCanvas.getContext("2d", { alpha: false });
+	const initialFrameCanvas = document.getElementById("initial-frame");
+	const initialFrameCtx = initialFrameCanvas.getContext("2d", { alpha: false });
 	const hitOverlayEl = document.getElementById("hit-overlay");
 	const canvas = document.getElementById("stage");
 	const ctx = canvas.getContext("2d", { alpha: true });
@@ -43,13 +45,18 @@
 	const portalSpawn = { x: 0.12, y: 0.5 };
 	const videoSources = {
 		av1: "https://media.coeurnix.party/spot-invaders-av1.mp4",
-		hq: "https://media.coeurnix.party/spot-invaders-hq.mp4?rev=4",
+		hq: "https://media.coeurnix.party/spot-invaders-hq.mp4",
 		lq: "https://media.coeurnix.party/spot-invaders-lq.mp4",
 	};
 	const av1Supported = ["video/mp4; codecs=\"av01.0.08M.08\"", "video/mp4; codecs=\"av01\"", "video/mp4; codecs=\"av01.0.05M.08\""].some(
 		(type) => video.canPlayType(type),
 	);
 	const preferredVideoQuality = av1Supported ? "av1" : "hq";
+	const VIDEO_SOFT_SEEK_DRIFT_SECONDS = 0.35;
+	const VIDEO_HARD_SEEK_DRIFT_SECONDS = 1.5;
+	const VIDEO_BUFFER_SEEK_MARGIN_SECONDS = 0.35;
+	const VIDEO_MIN_SEEK_INTERVAL_MS = 1250;
+	const VIDEO_BUFFERED_EPSILON_SECONDS = 0.05;
 
 	let ws = null;
 	let socketStatus = "idle";
@@ -70,6 +77,7 @@
 	let localStarted = false;
 	let isPlaying = false;
 	let isGameOver = false;
+	let hasRoomState = false;
 	let collisionArmedAt = 0;
 	let scoreStartedAt = 0;
 	let lastScoreText = "";
@@ -85,6 +93,9 @@
 	let hitEffectUntil = 0;
 	let hitEffectSeed = 0;
 	let lastVideoSyncAt = 0;
+	let lastVideoSeekAt = -Infinity;
+	let isVideoPrewarming = false;
+	let userActivatedVideoAudio = false;
 	let videoDurationSeconds = 0;
 	let currentVideoQuality = preferredVideoQuality;
 	let isSwitchingVideoSource = false;
@@ -113,6 +124,7 @@
 	let depthImageData = null;
 	let depthReadBlocked = false;
 	let videoFrameDrawn = false;
+	let initialFrameReady = false;
 
 	const players = new Map();
 	const sampleBuffers = new Map();
@@ -130,6 +142,7 @@
 	depthCanvas.width = DEPTH_WIDTH;
 	depthCanvas.height = DEPTH_HEIGHT;
 	const depthCtx = depthCanvas.getContext("2d", { willReadFrequently: true });
+	const initialFrameImage = new Image();
 	const soundEffects = {
 		zapCharging: new Audio("/media/zap-charging.mp3"),
 		zapBlast: new Audio("/media/zap-blast.mp3"),
@@ -141,6 +154,13 @@
 		playerJoined: new Audio("/media/player-joins.mp3"),
 	};
 	soundEffects.zapCharging.loop = true;
+	initialFrameImage.decoding = "async";
+	initialFrameImage.addEventListener("load", () => {
+		initialFrameReady = true;
+		drawInitialFrameToContext(initialFrameCtx);
+		updateInitialFrameVisibility();
+	});
+	initialFrameImage.src = "/media/initial-frame.webp";
 
 	gameOverLabelEl.hidden = true;
 
@@ -275,20 +295,45 @@
 		gameOverLabelEl.hidden = !isGameOver;
 	}
 
+	function shouldShowInitialFrame() {
+		return hasRoomState && roomStartServerMs === null && !localStarted && !isPlaying;
+	}
+
+	function updateInitialFrameVisibility() {
+		const visible = shouldShowInitialFrame();
+		initialFrameCanvas.classList.toggle("is-visible", visible);
+		if (visible) {
+			drawInitialFrameToContext(initialFrameCtx);
+		}
+	}
+
 	function beginPlaying() {
 		const wasPlaying = isPlaying;
+		const shouldRestartLocalRoomVideo =
+			roomStartServerMs === null && !wasPlaying && activeVideoDuration() && video.currentTime > 0.05;
 		if (!wasPlaying) {
 			scoreStartedAt = performance.now();
 			lastScoreText = "";
 		}
 		isPlaying = true;
 		isGameOver = false;
+		isVideoPrewarming = false;
+		userActivatedVideoAudio = true;
+		video.muted = false;
+		if (shouldRestartLocalRoomVideo) {
+			seekVideo(0);
+			drawInitialFrameToContext(videoFrameCtx);
+			videoFrameDrawn = initialFrameReady;
+			lastVideoSeekAt = performance.now();
+			lastVideoSyncAt = 0;
+		}
+		updateInitialFrameVisibility();
 		document.documentElement.style.setProperty("--hit-overlay-color", "#000000");
 		setOverlayVisible(false);
 		if (!wasPlaying) {
 			playSound(soundEffects.playerJoined);
 		}
-		video.play().catch(() => {});
+		tryPlayVideo();
 	}
 
 	function resetScore() {
@@ -501,6 +546,59 @@
 		return drift;
 	}
 
+	function bufferedAheadSeconds(time = video.currentTime) {
+		for (let index = 0; index < video.buffered.length; index += 1) {
+			const start = video.buffered.start(index);
+			const end = video.buffered.end(index);
+			if (time >= start - VIDEO_BUFFERED_EPSILON_SECONDS && time <= end + VIDEO_BUFFERED_EPSILON_SECONDS) {
+				return Math.max(0, end - time);
+			}
+		}
+		return 0;
+	}
+
+	function isTimeBuffered(time, requiredAheadSeconds = 0) {
+		for (let index = 0; index < video.buffered.length; index += 1) {
+			const start = video.buffered.start(index);
+			const end = video.buffered.end(index);
+			if (
+				time >= start - VIDEO_BUFFERED_EPSILON_SECONDS &&
+				time + requiredAheadSeconds <= end + VIDEO_BUFFERED_EPSILON_SECONDS
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	function seekVideo(targetSeconds) {
+		if (typeof video.fastSeek === "function") {
+			try {
+				video.fastSeek(targetSeconds);
+				return;
+			} catch {
+				// Fall back to the standard seek path.
+			}
+		}
+		video.currentTime = targetSeconds;
+	}
+
+	function tryPlayVideo() {
+		video.play().catch(() => {
+			// User activation and browser autoplay policy vary; future gestures retry.
+		});
+	}
+
+	function startVideoPrewarm() {
+		if (isPlaying) {
+			return;
+		}
+		isVideoPrewarming = true;
+		video.defaultMuted = true;
+		video.muted = !userActivatedVideoAudio;
+		tryPlayVideo();
+	}
+
 	function syncVideo(mediaMs, force = false) {
 		if (isSwitchingVideoSource) {
 			return;
@@ -509,11 +607,15 @@
 		if (roomStartServerMs === null) {
 			video.playbackRate = 1;
 			if (!isPlaying) {
-				if (!video.paused) {
+				if (isVideoPrewarming) {
+					if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+						tryPlayVideo();
+					}
+				} else if (!video.paused) {
 					video.pause();
 				}
-				if (activeVideoDuration() && !video.seeking && Math.abs(video.currentTime) > 0.001) {
-					video.currentTime = 0;
+				if (!isVideoPrewarming && activeVideoDuration() && !video.seeking && Math.abs(video.currentTime) > 0.001) {
+					seekVideo(0);
 				}
 			}
 			return;
@@ -530,14 +632,33 @@
 
 		const targetSeconds = mediaClockSeconds(mediaMs);
 		const drift = videoDriftSeconds(targetSeconds);
-		if (!video.seeking && (force || Math.abs(drift) > 0.08)) {
-			video.currentTime = targetSeconds;
+		const absDrift = Math.abs(drift);
+		const targetHasBuffer = isTimeBuffered(targetSeconds, VIDEO_BUFFER_SEEK_MARGIN_SECONDS);
+		const canHardSeek = force || now - lastVideoSeekAt >= VIDEO_MIN_SEEK_INTERVAL_MS;
+		const shouldSeek =
+			!video.seeking &&
+			(force ||
+				(absDrift > VIDEO_HARD_SEEK_DRIFT_SECONDS && canHardSeek) ||
+				(absDrift > VIDEO_SOFT_SEEK_DRIFT_SECONDS && targetHasBuffer && canHardSeek));
+		if (shouldSeek) {
+			seekVideo(targetSeconds);
+			lastVideoSeekAt = now;
+			video.playbackRate = 1;
+			if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+				tryPlayVideo();
+			}
+			return;
+		}
+		if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA && bufferedAheadSeconds() < 0.15) {
+			video.playbackRate = 1;
+			if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+				tryPlayVideo();
+			}
+			return;
 		}
 		video.playbackRate = Math.max(0.9, Math.min(1.1, 1 + drift * 0.35));
 		if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-			video.play().catch(() => {
-				// Muted autoplay is normally allowed; if blocked, the next user gesture retries.
-			});
+			tryPlayVideo();
 		}
 	}
 
@@ -569,6 +690,7 @@
 		isSwitchingVideoSource = true;
 		pendingVideoSwitchTime = targetSeconds;
 		lastVideoSyncAt = 0;
+		lastVideoSeekAt = -Infinity;
 		lastDepthFrameIndex = -1;
 		depthImageData = null;
 		resetAdaptiveQualityTimers(now);
@@ -600,7 +722,7 @@
 		lastVideoSyncAt = 0;
 		markCanvasDirty(displayedMediaMs() + 500);
 		if (isPlaying) {
-			video.play().catch(() => {});
+			tryPlayVideo();
 		}
 	}
 
@@ -754,6 +876,7 @@
 	}
 
 	function handleWelcome(message) {
+		hasRoomState = true;
 		playerId = message.playerId;
 		localColor = message.color;
 		roomStartServerMs = message.roomStartServerMs;
@@ -805,6 +928,10 @@
 		setStatus("synced");
 		markCanvasDirty();
 		startPing();
+		updateInitialFrameVisibility();
+		if (roomStartServerMs !== null) {
+			syncVideo(displayedMediaMs(), true);
+		}
 		if (pendingStartPoint) {
 			startAtNormalizedPoint(pendingStartPoint, true);
 			pendingStartPoint = null;
@@ -834,6 +961,7 @@
 			const sampleOffset = message.serverNowMs - performance.now();
 			clockOffsetMs = clockOffsetMs * 0.8 + sampleOffset * 0.2;
 		}
+		updateInitialFrameVisibility();
 		syncVideo(displayedMediaMs(), true);
 		collisionArmedAt = performance.now() + 180;
 		markCanvasDirty(displayedMediaMs() + currentMaxExtrapolateMs());
@@ -1080,6 +1208,7 @@
 		hitEffectSeed = Math.random() * 1000;
 		document.documentElement.style.setProperty("--hit-overlay-color", "#ff143d");
 		setOverlayVisible(true);
+		updateInitialFrameVisibility();
 		updatePortalLink();
 		markCanvasDirty(displayedMediaMs() + 1400);
 	}
@@ -1518,6 +1647,8 @@
 			canvas.height = Math.round(viewHeight * dpr);
 			videoFrameCanvas.width = Math.round(viewWidth * dpr);
 			videoFrameCanvas.height = Math.round(viewHeight * dpr);
+			initialFrameCanvas.width = Math.round(viewWidth * dpr);
+			initialFrameCanvas.height = Math.round(viewHeight * dpr);
 			videoFrameDrawn = false;
 		}
 		videoRect = {
@@ -1530,15 +1661,48 @@
 
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		videoFrameCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		initialFrameCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		if (didResize) {
 			videoFrameCtx.fillStyle = "#000000";
 			videoFrameCtx.fillRect(0, 0, viewWidth, viewHeight);
+			initialFrameCtx.fillStyle = "#000000";
+			initialFrameCtx.fillRect(0, 0, viewWidth, viewHeight);
 		}
 		canvasNeedsResize = false;
+		drawInitialFrameToContext(initialFrameCtx);
+		updateInitialFrameVisibility();
 		markCanvasDirty();
 	}
 
+	function drawInitialFrameToContext(targetCtx) {
+		targetCtx.fillStyle = "#000000";
+		targetCtx.fillRect(0, 0, viewWidth, viewHeight);
+		if (!initialFrameReady || !viewWidth || !viewHeight) {
+			return false;
+		}
+
+		try {
+			targetCtx.drawImage(
+				initialFrameImage,
+				0,
+				0,
+				COLOR_SOURCE_WIDTH,
+				FRAME_SOURCE_HEIGHT,
+				videoRect.x,
+				videoRect.y,
+				videoRect.width,
+				videoRect.height,
+			);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	function drawVideoFrame() {
+		if (!hasRoomState && !isPlaying) {
+			return;
+		}
 		if (video.seeking || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
 			return;
 		}
@@ -1880,6 +2044,9 @@
 		activeVideoDuration();
 		finishVideoQualitySwitch();
 		syncVideo(displayedMediaMs(), true);
+		if (!isPlaying) {
+			startVideoPrewarm();
+		}
 		markCanvasDirty();
 	});
 	video.addEventListener("play", () => markCanvasDirty());
@@ -1894,6 +2061,9 @@
 	});
 	video.addEventListener("canplay", () => {
 		finishVideoQualitySwitch();
+		if (!isPlaying) {
+			startVideoPrewarm();
+		}
 		markCanvasDirty();
 	});
 	window.addEventListener("resize", () => {
@@ -1902,8 +2072,11 @@
 	});
 
 	updatePortalLink();
+	video.defaultMuted = true;
+	video.muted = true;
 	video.src = videoSources[currentVideoQuality];
 	video.load();
+	startVideoPrewarm();
 	connect();
 	resizeCanvas();
 	setOverlayVisible(!fromPortal);
